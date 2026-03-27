@@ -230,7 +230,12 @@ if TYPE_CHECKING:
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
+
+
     VLLM_LORA_DISABLE_PDL: bool = False
+    
+    # TD-Pipe: Enable temporally-disaggregated pipeline parallelism for high-throughput inference
+    VLLM_USE_TD_PIPE: bool = False
 
 
 def get_default_cache_root():
@@ -1534,9 +1539,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Disable logging of vLLM logo at server startup time.
     "VLLM_DISABLE_LOG_LOGO": lambda: bool(int(os.getenv("VLLM_DISABLE_LOG_LOGO", "0"))),
+
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    # TD-Pipe: Enable temporally-disaggregated pipeline parallelism for high-throughput inference
+    # When enabled, the scheduler will separate prefill and decode phases in time dimension
+    # to reduce pipeline bubbles and improve throughput on multi-GPU systems
+    "VLLM_USE_TD_PIPE": lambda: bool(int(os.getenv("VLLM_USE_TD_PIPE", "0"))),
 }
 
 

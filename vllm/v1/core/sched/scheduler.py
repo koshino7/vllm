@@ -56,6 +56,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.core.sched.td_pipe_scheduler import TDPipeSchedulerMixin
 
 logger = init_logger(__name__)
 
@@ -237,6 +238,9 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # Initialize TD-Pipe scheduler mixin
+        self.td_pipe = TDPipeSchedulerMixin(self)
+
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
                 isinstance(group_spec.kv_cache_spec, MambaSpec)
@@ -330,6 +334,10 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # TD-Pipe: Update scheduling mode and check if we're in prefill mode
+        td_pipe_prefill_mode = self.td_pipe.update_mode()
+        td_pipe_enabled = self.td_pipe.td_pipe_enabled
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -347,9 +355,13 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # TD-Pipe: If in prefill mode and TD-Pipe is enabled, skip running requests
+        # (they will be scheduled in decode mode)
+        skip_running_requests = td_pipe_enabled and td_pipe_prefill_mode
+
         # First, schedule the RUNNING requests.
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while not skip_running_requests and req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             if (
@@ -529,8 +541,12 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        # TD-Pipe: If in decode mode and TD-Pipe is enabled, skip waiting requests
+        # (they will be scheduled in prefill mode)
+        skip_waiting_requests = td_pipe_enabled and not td_pipe_prefill_mode
+
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        if not skip_waiting_requests and not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
