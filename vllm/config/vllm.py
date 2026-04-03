@@ -40,6 +40,7 @@ from .observability import ObservabilityConfig
 from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .scheduler import SchedulerConfig
+from .spec_prefill import SpecPrefillConfig
 from .speculative import EagleModelTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
@@ -271,6 +272,10 @@ class VllmConfig:
     performance, with -O0 having the best startup time and -O3 having the best
     performance. -02 is used by defult. See  OptimizationLevel for full
     description."""
+
+    spec_prefill_config: SpecPrefillConfig | None = None
+    """Speculative prefill configuration. Uses a small draft model to estimate
+    token importance and compress the prompt before the main model prefill."""
 
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
@@ -602,6 +607,18 @@ class VllmConfig:
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
+
+        if self.spec_prefill_config is not None:
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "Speculative prefill and speculative decoding cannot "
+                    "be enabled at the same time."
+                )
+            if not self.spec_prefill_config.spec_model:
+                raise ValueError(
+                    "spec_prefill_config.spec_model must be set to a "
+                    "valid draft model name or path."
+                )
 
         if self.quant_config is None and self.model_config is not None:
             self.quant_config = VllmConfig._get_quantization_config(

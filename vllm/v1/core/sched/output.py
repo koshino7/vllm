@@ -238,6 +238,14 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # ── Speculative Prefill ──────────────────────────────────────────
+    # req_id -> compressed_token_ids (tokens kept after importance scoring)
+    spec_prefill_compressed_tokens: dict[str, list[int]] | None = None
+    # req_id -> original position ids for the compressed tokens
+    spec_prefill_position_ids: dict[str, list[int]] | None = None
+    # Whether speculative prefill is active for this scheduling step
+    use_spec_prefill: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

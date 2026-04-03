@@ -489,6 +489,20 @@ class GPUModelRunner(
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
 
+        # Speculative prefill.
+        self.spec_prefill_config = vllm_config.spec_prefill_config
+        self.spec_prefill_runner: "SpecPrefillRunner | None" = None  # type: ignore[name-defined]  # noqa: E501
+        if self.spec_prefill_config is not None:
+            from vllm.v1.spec_prefill.runner import SpecPrefillRunner
+
+            self.spec_prefill_runner = SpecPrefillRunner(
+                config=self.spec_prefill_config,
+                device=device,
+                dtype=self.dtype,
+            )
+        # req_id -> original position ids for compressed prompts
+        self._spec_prefill_position_ids: dict[str, list[int]] = {}
+
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
@@ -870,6 +884,70 @@ class GPUModelRunner(
     # Note: used for model runner override.
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
+
+    def _apply_spec_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Run speculative prefill on new requests and modify scheduler_output.
+
+        For each new prefill request the draft model estimates token importance,
+        compresses the prompt, and rewrites ``scheduler_output`` so that the
+        main model only processes the compressed tokens with their original
+        position ids.
+        """
+        if self.spec_prefill_runner is None:
+            return
+        if not scheduler_output.use_spec_prefill:
+            return
+        if not scheduler_output.scheduled_new_reqs:
+            return
+
+        req_ids: list[str] = []
+        prompts: list[list[int]] = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.prompt_token_ids is not None:
+                req_ids.append(new_req.req_id)
+                prompts.append(list(new_req.prompt_token_ids))
+
+        if not req_ids:
+            return
+
+        batch_meta = self.spec_prefill_runner.run(req_ids, prompts)
+
+        total_token_delta = 0
+        for new_req in scheduler_output.scheduled_new_reqs:
+            meta = batch_meta.per_request.get(new_req.req_id)
+            if meta is None:
+                continue
+
+            old_len = len(new_req.prompt_token_ids)  # type: ignore[arg-type]
+            new_req.prompt_token_ids = meta.compressed_token_ids
+            new_len = len(meta.compressed_token_ids)
+
+            self._spec_prefill_position_ids[new_req.req_id] = meta.position_ids
+
+            delta = old_len - new_len
+            total_token_delta += delta
+
+            if new_req.req_id in scheduler_output.num_scheduled_tokens:
+                old_sched = scheduler_output.num_scheduled_tokens[new_req.req_id]
+                scheduler_output.num_scheduled_tokens[new_req.req_id] = (
+                    old_sched - delta
+                )
+
+        scheduler_output.total_num_scheduled_tokens -= total_token_delta
+
+        scheduler_output.spec_prefill_compressed_tokens = {
+            rid: batch_meta.per_request[rid].compressed_token_ids
+            for rid in req_ids
+            if rid in batch_meta.per_request
+        }
+        scheduler_output.spec_prefill_position_ids = {
+            rid: batch_meta.per_request[rid].position_ids
+            for rid in req_ids
+            if rid in batch_meta.per_request
+        }
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -1488,6 +1566,21 @@ class GPUModelRunner(
             arange,
             out=positions_np,
         )
+
+        # Override positions for spec-prefill compressed prompts so that
+        # the model sees the original (non-contiguous) position ids.
+        if self._spec_prefill_position_ids:
+            offset = 0
+            for req_idx in range(num_reqs):
+                n_tokens = num_scheduled_tokens[req_idx]
+                req_id = self.input_batch.req_ids[req_idx]
+                if req_id in self._spec_prefill_position_ids:
+                    pos_ids = self._spec_prefill_position_ids[req_id]
+                    positions_np[offset : offset + n_tokens] = np.array(
+                        pos_ids[:n_tokens], dtype=positions_np.dtype
+                    )
+                    del self._spec_prefill_position_ids[req_id]
+                offset += n_tokens
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -3337,6 +3430,9 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            # Run speculative prefill (compresses prompt before main model).
+            self._apply_spec_prefill(scheduler_output)
+
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
@@ -4147,6 +4243,9 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                if self.spec_prefill_runner is not None:
+                    self.spec_prefill_runner.load_draft_model()
+
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)

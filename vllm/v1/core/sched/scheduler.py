@@ -210,6 +210,9 @@ class Scheduler(SchedulerInterface):
             else 0
         )
 
+        self.spec_prefill_config = vllm_config.spec_prefill_config
+        self.use_spec_prefill = self.spec_prefill_config is not None
+
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
@@ -857,6 +860,12 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        # Mark step as spec-prefill if any newly-scheduled request is in
+        # its initial prefill phase and the feature is enabled.
+        step_use_spec_prefill = False
+        if self.use_spec_prefill and scheduled_new_reqs:
+            step_use_spec_prefill = True
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -866,12 +875,9 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
-            # finished_req_ids is an existing state in the scheduler,
-            # instead of being newly scheduled in this step.
-            # It contains the request IDs that are finished in between
-            # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            use_spec_prefill=step_use_spec_prefill,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

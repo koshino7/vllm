@@ -52,6 +52,7 @@ from vllm.config import (
     PoolerConfig,
     ProfilerConfig,
     SchedulerConfig,
+    SpecPrefillConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
     VllmConfig,
@@ -510,6 +511,8 @@ class EngineArgs:
     logits_processor_pattern: str | None = ModelConfig.logits_processor_pattern
 
     speculative_config: dict[str, Any] | None = None
+
+    spec_prefill_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
@@ -1194,6 +1197,10 @@ class EngineArgs:
         vllm_group.add_argument(
             "--speculative-config", **vllm_kwargs["speculative_config"]
         )
+        vllm_kwargs["spec_prefill_config"]["type"] = optional_type(json.loads)
+        vllm_group.add_argument(
+            "--spec-prefill-config", **vllm_kwargs["spec_prefill_config"]
+        )
         vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
         )
@@ -1376,6 +1383,18 @@ class EngineArgs:
             }
         )
         return SpeculativeConfig(**self.speculative_config)
+
+    def create_spec_prefill_config(self) -> SpecPrefillConfig | None:
+        """Build SpecPrefillConfig from CLI / env-var settings.
+
+        The feature is gated by the VLLM_USE_SPEC_PREFILL env var.
+        When the env var is set, ``--spec-prefill-config`` must provide
+        at least ``spec_model``.
+        """
+        if not envs.VLLM_USE_SPEC_PREFILL:
+            return None
+        cfg_dict = self.spec_prefill_config or {}
+        return SpecPrefillConfig(**cfg_dict)
 
     def create_engine_config(
         self,
@@ -1660,6 +1679,8 @@ class EngineArgs:
             target_parallel_config=parallel_config,
         )
 
+        spec_prefill_config = self.create_spec_prefill_config()
+
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -1800,6 +1821,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            spec_prefill_config=spec_prefill_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
             compilation_config=compilation_config,
