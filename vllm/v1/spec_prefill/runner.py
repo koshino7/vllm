@@ -203,7 +203,11 @@ class SpecPrefillRunner:
         self,
         query_buffer: list[list[torch.Tensor]],
     ) -> list[torch.utils.hooks.RemovableHook]:
-        """Register forward hooks on each attention layer to capture Q."""
+        """Register forward hooks on each attention layer to capture Q.
+
+        Uses ``with_kwargs=True`` so that models calling ``self_attn``
+        with keyword arguments (e.g. Qwen3) are handled correctly.
+        """
         hooks: list[torch.utils.hooks.RemovableHook] = []
         for layer_idx, layer in enumerate(
             self.draft_model.model.layers  # type: ignore[union-attr]
@@ -213,17 +217,21 @@ class SpecPrefillRunner:
             def _hook(
                 module: torch.nn.Module,
                 args: tuple,
-                output: torch.Tensor,
+                kwargs: dict,
+                output: object,
                 buf: list[list[torch.Tensor]] = query_buffer,
                 idx: int = layer_idx,
             ) -> None:
-                hidden = args[0] if isinstance(args[0], torch.Tensor) else args[0]
-                q, _, _ = module.q_proj(hidden), None, None  # type: ignore[attr-defined]
-                # We only need q; re-project is cheap for the small draft model
+                if args:
+                    hidden = args[0]
+                else:
+                    hidden = kwargs.get("hidden_states")
+                if hidden is None:
+                    return
                 q_proj = module.q_proj(hidden)  # type: ignore[attr-defined]
                 buf[idx].append(q_proj.detach())
 
-            h = attn_module.register_forward_hook(_hook)
+            h = attn_module.register_forward_hook(_hook, with_kwargs=True)
             hooks.append(h)
         return hooks
 
