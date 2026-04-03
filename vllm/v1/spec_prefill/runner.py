@@ -3,11 +3,14 @@
 
 """Speculative prefill runner for vLLM v1.
 
-This module loads a lightweight draft model **on CPU**, runs look-ahead
-decoding to capture query/key vectors, estimates token importance via
-attention scores, and returns compressed prompt metadata to the main
-model runner.  Running entirely on CPU avoids competing with the main
-model / KV-cache for GPU memory.
+This module loads a lightweight draft model on the same GPU as the main
+model, runs look-ahead decoding to capture query/key vectors, estimates
+token importance via attention scores, and returns compressed prompt
+metadata to the main model runner.
+
+The draft model's weight and activation memory are properly accounted for
+by vLLM's memory profiler (DeviceMemoryProfiler + profile_run) so that
+KV-cache allocation leaves enough headroom.
 """
 
 from __future__ import annotations
@@ -33,27 +36,22 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# The draft model is intentionally kept on CPU so that it does not
-# consume any GPU memory that vLLM reserves for the main model and
-# KV cache.  For small draft models (0.6B–4B) CPU inference is fast
-# enough given that spec-prefill only runs once per new prefill request.
-_DRAFT_DEVICE = torch.device("cpu")
-_DRAFT_DTYPE = torch.float32  # CPU does not benefit from fp16
-
 
 class SpecPrefillRunner:
     """Orchestrates the speculative prefill pipeline.
 
-    The draft model lives entirely on **CPU** to avoid GPU OOM caused by
-    vLLM's KV-cache allocation not accounting for draft-model activations.
+    The draft model lives on the same GPU as the main model.  Its weight
+    and peak-activation memory are profiled during startup so that the
+    KV-cache allocator reserves enough headroom.
 
     Lifecycle
     ---------
-    1. ``__init__`` / ``load_draft_model``: Load the draft model (CPU).
-    2. ``run``: Called by ``GPUModelRunner`` for each scheduling step that
-       contains new prefill requests.  Returns
-       :class:`SpecPrefillBatchMetadata` which the main model runner uses
-       to build compressed prompt inputs.
+    1. ``load_draft_model``: Load the draft model (GPU, inside
+       DeviceMemoryProfiler).
+    2. ``dummy_run``: Called during ``profile_run`` so that draft-model
+       activation memory is captured by ``torch_peak_increase``.
+    3. ``run``: Called by ``GPUModelRunner`` for each scheduling step that
+       contains new prefill requests.
     """
 
     def __init__(
@@ -63,10 +61,8 @@ class SpecPrefillRunner:
         dtype: torch.dtype,
     ) -> None:
         self.config = config
-        # ``device`` / ``dtype`` are the *GPU* device & dtype from the main
-        # model runner — kept for reference but NOT used for the draft model.
-        self.gpu_device = device
-        self.gpu_dtype = dtype
+        self.device = device
+        self.dtype = dtype
         self.draft_model: PreTrainedModel | None = None
         self._num_layers: int = 0
         self._num_heads: int = 0
@@ -77,18 +73,19 @@ class SpecPrefillRunner:
     # Model loading
     # ------------------------------------------------------------------
     def load_draft_model(self) -> None:
-        """Load the draft model onto CPU."""
+        """Load the draft model onto the same GPU as the main model."""
         from transformers import AutoModelForCausalLM
 
         logger.info(
-            "Loading spec-prefill draft model on CPU: %s",
+            "Loading spec-prefill draft model on %s: %s",
+            self.device,
             self.config.spec_model,
         )
         self.draft_model = AutoModelForCausalLM.from_pretrained(
             self.config.spec_model,
-            torch_dtype=_DRAFT_DTYPE,
+            torch_dtype=self.dtype,
             attn_implementation="sdpa",
-        )  # stays on CPU — no .to(device)
+        ).to(self.device)
         self.draft_model.eval()
 
         hf_config = self.draft_model.config
@@ -99,13 +96,40 @@ class SpecPrefillRunner:
         )
         self._head_dim = hf_config.hidden_size // self._num_heads
         logger.info(
-            "Draft model loaded on CPU — layers=%d, heads=%d, kv_heads=%d, "
+            "Draft model loaded on %s — layers=%d, heads=%d, kv_heads=%d, "
             "head_dim=%d",
+            self.device,
             self._num_layers,
             self._num_heads,
             self._num_kv_heads,
             self._head_dim,
         )
+
+    # ------------------------------------------------------------------
+    # Dummy run for memory profiling
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def dummy_run(self, max_num_tokens: int) -> None:
+        """Run a dummy forward pass so that peak activation memory is
+        captured by ``torch.cuda.max_memory_allocated`` during
+        ``profile_run``.
+        """
+        assert self.draft_model is not None, "Draft model not loaded"
+        cfg = self.config
+        dummy_ids = torch.zeros(
+            (1, max_num_tokens), dtype=torch.long, device=self.device
+        )
+        past_key_values = None
+        for _ in range(cfg.look_ahead_cnt + 1):
+            outputs = self.draft_model(
+                input_ids=dummy_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
+        del outputs, past_key_values
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -116,10 +140,7 @@ class SpecPrefillRunner:
         req_ids: list[str],
         prompt_token_ids_list: list[list[int]],
     ) -> SpecPrefillBatchMetadata:
-        """Run speculative prefill for a batch of new prefill requests.
-
-        Everything runs on CPU — zero GPU memory impact.
-        """
+        """Run speculative prefill for a batch of new prefill requests."""
         assert self.draft_model is not None, "Draft model not loaded"
         batch_meta = SpecPrefillBatchMetadata()
 
@@ -127,6 +148,7 @@ class SpecPrefillRunner:
             meta = self._speculate_single(req_id, prompt_token_ids)
             batch_meta.add(meta)
 
+        torch.cuda.empty_cache()
         return batch_meta
 
     # ------------------------------------------------------------------
@@ -137,10 +159,10 @@ class SpecPrefillRunner:
         req_id: str,
         prompt_token_ids: list[int],
     ) -> SpecPrefillMetadata:
-        """Run look-ahead + importance estimation for one request (CPU)."""
+        """Run look-ahead + importance estimation for one request."""
         cfg = self.config
         input_ids = torch.tensor(
-            [prompt_token_ids], dtype=torch.long, device=_DRAFT_DEVICE
+            [prompt_token_ids], dtype=torch.long, device=self.device
         )
 
         query_buffer: list[list[torch.Tensor]] = [
@@ -182,6 +204,9 @@ class SpecPrefillRunner:
         del past_key_values, outputs
 
         all_queries = self._collect_queries(query_buffer, actual_look_ahead)
+
+        all_queries = all_queries.cpu()
+        all_keys = all_keys.cpu()
 
         attn_scores = self._compute_attention_scores(
             all_queries, all_keys, actual_look_ahead

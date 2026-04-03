@@ -4301,6 +4301,8 @@ class GPUModelRunner(
                         aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
+                if self.spec_prefill_runner is not None:
+                    self.spec_prefill_runner.load_draft_model()
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -4320,10 +4322,6 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
-        # Load the spec-prefill draft model on CPU (outside the GPU memory
-        # profiler so it does not affect KV-cache budget).
-        if self.spec_prefill_runner is not None:
-            self.spec_prefill_runner.load_draft_model()
 
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
@@ -5276,6 +5274,9 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
+        if self.spec_prefill_runner is not None:
+            self.spec_prefill_runner.dummy_run(self.max_num_tokens)
+
         self._sync_device()
         del hidden_states, output
         self.encoder_cache.clear()
