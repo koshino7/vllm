@@ -5274,13 +5274,16 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
-        if self.spec_prefill_runner is not None:
-            self.spec_prefill_runner.dummy_run(self.max_num_tokens)
-
         self._sync_device()
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        if self.spec_prefill_runner is not None:
+            draft_profile_len = min(
+                self.max_model_len,
+                self.spec_prefill_runner.draft_model.config.max_position_embeddings,
+            )
+            self.spec_prefill_runner.dummy_run(draft_profile_len)
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
