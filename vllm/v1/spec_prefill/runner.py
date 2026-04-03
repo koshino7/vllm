@@ -3,9 +3,11 @@
 
 """Speculative prefill runner for vLLM v1.
 
-This module loads a lightweight draft model, runs look-ahead decoding to
-capture query/key vectors, estimates token importance via attention scores,
-and returns compressed prompt metadata to the main model runner.
+This module loads a lightweight draft model **on CPU**, runs look-ahead
+decoding to capture query/key vectors, estimates token importance via
+attention scores, and returns compressed prompt metadata to the main
+model runner.  Running entirely on CPU avoids competing with the main
+model / KV-cache for GPU memory.
 """
 
 from __future__ import annotations
@@ -31,13 +33,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The draft model is intentionally kept on CPU so that it does not
+# consume any GPU memory that vLLM reserves for the main model and
+# KV cache.  For small draft models (0.6B–4B) CPU inference is fast
+# enough given that spec-prefill only runs once per new prefill request.
+_DRAFT_DEVICE = torch.device("cpu")
+_DRAFT_DTYPE = torch.float32  # CPU does not benefit from fp16
+
 
 class SpecPrefillRunner:
-    """Orchestrates the speculative prefill pipeline on GPU.
+    """Orchestrates the speculative prefill pipeline.
+
+    The draft model lives entirely on **CPU** to avoid GPU OOM caused by
+    vLLM's KV-cache allocation not accounting for draft-model activations.
 
     Lifecycle
     ---------
-    1. ``__init__`` / ``load_draft_model``: Load the draft model once.
+    1. ``__init__`` / ``load_draft_model``: Load the draft model (CPU).
     2. ``run``: Called by ``GPUModelRunner`` for each scheduling step that
        contains new prefill requests.  Returns
        :class:`SpecPrefillBatchMetadata` which the main model runner uses
@@ -51,30 +63,32 @@ class SpecPrefillRunner:
         dtype: torch.dtype,
     ) -> None:
         self.config = config
-        self.device = device
-        self.dtype = dtype
+        # ``device`` / ``dtype`` are the *GPU* device & dtype from the main
+        # model runner — kept for reference but NOT used for the draft model.
+        self.gpu_device = device
+        self.gpu_dtype = dtype
         self.draft_model: PreTrainedModel | None = None
         self._num_layers: int = 0
         self._num_heads: int = 0
         self._num_kv_heads: int = 0
         self._head_dim: int = 0
-        self._current_step: int = 0
 
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
     def load_draft_model(self) -> None:
-        """Load the draft model onto ``self.device``."""
+        """Load the draft model onto CPU."""
         from transformers import AutoModelForCausalLM
 
         logger.info(
-            "Loading spec-prefill draft model: %s", self.config.spec_model
+            "Loading spec-prefill draft model on CPU: %s",
+            self.config.spec_model,
         )
         self.draft_model = AutoModelForCausalLM.from_pretrained(
             self.config.spec_model,
-            torch_dtype=self.dtype,
+            torch_dtype=_DRAFT_DTYPE,
             attn_implementation="sdpa",
-        ).to(self.device)
+        )  # stays on CPU — no .to(device)
         self.draft_model.eval()
 
         hf_config = self.draft_model.config
@@ -85,7 +99,7 @@ class SpecPrefillRunner:
         )
         self._head_dim = hf_config.hidden_size // self._num_heads
         logger.info(
-            "Draft model loaded — layers=%d, heads=%d, kv_heads=%d, "
+            "Draft model loaded on CPU — layers=%d, heads=%d, kv_heads=%d, "
             "head_dim=%d",
             self._num_layers,
             self._num_heads,
@@ -104,25 +118,14 @@ class SpecPrefillRunner:
     ) -> SpecPrefillBatchMetadata:
         """Run speculative prefill for a batch of new prefill requests.
 
-        Args:
-            req_ids: Request identifiers.
-            prompt_token_ids_list: One list of token ids per request.
-
-        Returns:
-            :class:`SpecPrefillBatchMetadata` containing compressed prompts.
+        Everything runs on CPU — zero GPU memory impact.
         """
         assert self.draft_model is not None, "Draft model not loaded"
         batch_meta = SpecPrefillBatchMetadata()
 
-        # Reclaim fragmented GPU memory before running the draft model.
-        torch.cuda.empty_cache()
-
         for req_id, prompt_token_ids in zip(req_ids, prompt_token_ids_list):
             meta = self._speculate_single(req_id, prompt_token_ids)
             batch_meta.add(meta)
-
-        # Free any leftover activations.
-        torch.cuda.empty_cache()
 
         return batch_meta
 
@@ -134,19 +137,15 @@ class SpecPrefillRunner:
         req_id: str,
         prompt_token_ids: list[int],
     ) -> SpecPrefillMetadata:
-        """Run look-ahead + importance estimation for one request."""
+        """Run look-ahead + importance estimation for one request (CPU)."""
         cfg = self.config
         input_ids = torch.tensor(
-            [prompt_token_ids], dtype=torch.long, device=self.device
+            [prompt_token_ids], dtype=torch.long, device=_DRAFT_DEVICE
         )
 
-        # query_buffer[layer_idx] stores one Q tensor per *look-ahead* step.
-        # Step 0 (prefill) is skipped to save memory — only the last token's
-        # Q from decode steps 1..N matters.
         query_buffer: list[list[torch.Tensor]] = [
             [] for _ in range(self._num_layers)
         ]
-        self._current_step = 0
         hooks = self._register_query_hooks(query_buffer)
 
         past_key_values = None
@@ -156,7 +155,6 @@ class SpecPrefillRunner:
 
         try:
             for step in range(cfg.look_ahead_cnt + 1):
-                self._current_step = step
                 outputs = self.draft_model(
                     input_ids=cur_input_ids,
                     past_key_values=past_key_values,
@@ -165,17 +163,12 @@ class SpecPrefillRunner:
                 past_key_values = outputs.past_key_values
 
                 if step == 0:
-                    # Clear prefill-step Q tensors that were captured
-                    # (the hook may still fire for step 0).
                     for layer_buf in query_buffer:
                         layer_buf.clear()
                     continue
 
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
-                if (
-                    not cfg.ignore_eos
-                    and next_token.item() in stop_set
-                ):
+                if not cfg.ignore_eos and next_token.item() in stop_set:
                     actual_look_ahead = step
                     break
                 cur_input_ids = next_token.unsqueeze(0)
@@ -183,23 +176,15 @@ class SpecPrefillRunner:
             for h in hooks:
                 h.remove()
 
-        # Extract keys from KV cache (prompt region only), then free cache.
         all_keys = self._collect_keys_from_cache(
             past_key_values, len(prompt_token_ids)
         )
         del past_key_values, outputs
-        torch.cuda.empty_cache()
 
         all_queries = self._collect_queries(query_buffer, actual_look_ahead)
 
-        # Move Q/K to CPU for the attention score computation to save GPU mem.
-        all_queries_cpu = all_queries.float().cpu()
-        all_keys_cpu = all_keys.float().cpu()
-        del all_queries, all_keys
-        torch.cuda.empty_cache()
-
         attn_scores = self._compute_attention_scores(
-            all_queries_cpu, all_keys_cpu, actual_look_ahead
+            all_queries, all_keys, actual_look_ahead
         )
 
         importance = compute_token_importance(
@@ -224,19 +209,13 @@ class SpecPrefillRunner:
         )
 
     # ------------------------------------------------------------------
-    # Query hook registration (captures Q from each layer)
+    # Query hook registration
     # ------------------------------------------------------------------
     def _register_query_hooks(
         self,
         query_buffer: list[list[torch.Tensor]],
     ) -> list[torch.utils.hooks.RemovableHook]:
-        """Register forward hooks on each attention layer to capture Q.
-
-        Only the **last token's** Q projection is saved (moved to CPU)
-        to minimise GPU memory pressure.  Uses ``with_kwargs=True`` so
-        that models calling ``self_attn`` with keyword arguments (e.g.
-        Qwen3) are handled correctly.
-        """
+        """Register forward hooks to capture the last token's Q per layer."""
         hooks: list[torch.utils.hooks.RemovableHook] = []
         for layer_idx, layer in enumerate(
             self.draft_model.model.layers  # type: ignore[union-attr]
@@ -257,10 +236,9 @@ class SpecPrefillRunner:
                     hidden = kwargs.get("hidden_states")
                 if hidden is None:
                     return
-                # Only project the last token to save memory.
                 last_hidden = hidden[:, -1:, :]
                 q_last = module.q_proj(last_hidden)  # type: ignore[attr-defined]
-                buf[idx].append(q_last.detach().cpu())
+                buf[idx].append(q_last.detach())
 
             h = attn_module.register_forward_hook(_hook, with_kwargs=True)
             hooks.append(h)
@@ -274,40 +252,38 @@ class SpecPrefillRunner:
         query_buffer: list[list[torch.Tensor]],
         actual_look_ahead: int,
     ) -> torch.Tensor:
-        """Stack captured queries into ``[num_layers, look_ahead, H*D]``.
-
-        Tensors live on CPU at this point.
-        """
+        """Stack captured queries into ``[num_layers, look_ahead, H*D]``."""
         per_layer = []
         for layer_bufs in query_buffer:
             qs = layer_bufs[:actual_look_ahead]
             if qs:
-                per_layer.append(torch.cat(qs, dim=1))  # [1, look_ahead, H*D]
+                per_layer.append(torch.cat(qs, dim=1))
             else:
-                per_layer.append(layer_bufs[0] if layer_bufs else
-                                 torch.zeros(1, 1, self._num_heads * self._head_dim))
-        result = torch.stack(per_layer, dim=0).squeeze(1)  # [L, look_ahead, H*D]
-        return result
+                per_layer.append(
+                    layer_bufs[0]
+                    if layer_bufs
+                    else torch.zeros(1, 1, self._num_heads * self._head_dim)
+                )
+        return torch.stack(per_layer, dim=0).squeeze(1)
 
     def _collect_keys_from_cache(
         self,
         past_key_values: tuple,
         prompt_len: int,
     ) -> torch.Tensor:
-        """Extract prompt-region keys from HF KV cache, move to CPU.
+        """Extract prompt-region keys from HF KV cache.
 
         Returns: ``[num_layers, prompt_len, num_kv_heads, head_dim]``
         """
         per_layer = []
         for layer_kv in past_key_values:
             k = layer_kv[0]  # [batch, num_kv_heads, total_len, head_dim]
-            # .contiguous().cpu() to avoid keeping the full cache alive.
-            k_prompt = k[:, :, :prompt_len, :].squeeze(0).contiguous().cpu()
+            k_prompt = k[:, :, :prompt_len, :].squeeze(0).contiguous()
             per_layer.append(k_prompt)
         return torch.stack(per_layer, dim=0)
 
     # ------------------------------------------------------------------
-    # Attention score computation (runs on CPU)
+    # Attention score computation
     # ------------------------------------------------------------------
     def _compute_attention_scores(
         self,
@@ -315,7 +291,7 @@ class SpecPrefillRunner:
         keys: torch.Tensor,
         actual_look_ahead: int,
     ) -> torch.Tensor:
-        """Compute Q*K^T attention scores on CPU.
+        """Compute Q*K^T attention scores.
 
         Args:
             queries: ``[num_layers, look_ahead, hidden_dim]``
@@ -327,14 +303,12 @@ class SpecPrefillRunner:
         num_layers = queries.shape[0]
         look_ahead = queries.shape[1]
 
-        # Reshape Q: [L, look_ahead, num_heads, head_dim]
-        q = queries.view(num_layers, look_ahead, self._num_heads, self._head_dim)
-        # -> [L, num_heads, look_ahead, head_dim]
+        q = queries.view(
+            num_layers, look_ahead, self._num_heads, self._head_dim
+        )
         q = q.transpose(1, 2)
 
-        # Expand KV heads to match Q heads
         repeat_factor = self._num_heads // self._num_kv_heads
-        # keys: [L, prompt_len, kv_heads, head_dim] -> [L, kv_heads, prompt_len, head_dim]
         k = keys.transpose(1, 2)
         if repeat_factor > 1:
             k = k.repeat_interleave(repeat_factor, dim=1)

@@ -4243,9 +4243,6 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if self.spec_prefill_runner is not None:
-                    self.spec_prefill_runner.load_draft_model()
-
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
@@ -4323,6 +4320,11 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        # Load the spec-prefill draft model on CPU (outside the GPU memory
+        # profiler so it does not affect KV-cache budget).
+        if self.spec_prefill_runner is not None:
+            self.spec_prefill_runner.load_draft_model()
+
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)
