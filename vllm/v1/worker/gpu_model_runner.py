@@ -923,7 +923,6 @@ class GPUModelRunner(
             if meta is None:
                 continue
 
-            old_len = len(new_req.prompt_token_ids)  # type: ignore[arg-type]
             new_req.prompt_token_ids = meta.compressed_token_ids
             new_len = len(meta.compressed_token_ids)
 
@@ -933,14 +932,10 @@ class GPUModelRunner(
                     meta.position_offset
                 )
 
-            delta = old_len - new_len
-            total_token_delta += delta
-
             if new_req.req_id in scheduler_output.num_scheduled_tokens:
                 old_sched = scheduler_output.num_scheduled_tokens[new_req.req_id]
-                scheduler_output.num_scheduled_tokens[new_req.req_id] = (
-                    old_sched - delta
-                )
+                scheduler_output.num_scheduled_tokens[new_req.req_id] = new_len
+                total_token_delta += old_sched - new_len
 
         scheduler_output.total_num_scheduled_tokens -= total_token_delta
 
