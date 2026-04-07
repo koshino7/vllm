@@ -120,15 +120,29 @@ class SpecPrefillRunner:
             (1, max_num_tokens), dtype=torch.long, device=self.device
         )
         past_key_values = None
-        for _ in range(cfg.look_ahead_cnt + 1):
-            outputs = self.draft_model(
-                input_ids=dummy_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = outputs.past_key_values
-            dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
-        del outputs, past_key_values
+        for i in range(cfg.look_ahead_cnt + 1):
+            if i == 0:
+                base_out = self.draft_model.model(
+                    input_ids=dummy_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = base_out.past_key_values
+                last_hidden = base_out.last_hidden_state[:, -1:, :]
+                dummy_ids = self.draft_model.lm_head(last_hidden).argmax(
+                    dim=-1
+                )
+                del base_out, last_hidden
+            else:
+                outputs = self.draft_model(
+                    input_ids=dummy_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = outputs.past_key_values
+                dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
+                del outputs
+        del past_key_values
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -177,17 +191,27 @@ class SpecPrefillRunner:
 
         try:
             for step in range(cfg.look_ahead_cnt + 1):
+                if step == 0:
+                    base_out = self.draft_model.model(
+                        input_ids=cur_input_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    past_key_values = base_out.past_key_values
+                    last_hidden = base_out.last_hidden_state[:, -1:, :]
+                    logits_last = self.draft_model.lm_head(last_hidden)
+                    cur_input_ids = logits_last.argmax(dim=-1)
+                    del base_out, last_hidden, logits_last
+                    for layer_buf in query_buffer:
+                        layer_buf.clear()
+                    continue
+
                 outputs = self.draft_model(
                     input_ids=cur_input_ids,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
                 past_key_values = outputs.past_key_values
-
-                if step == 0:
-                    for layer_buf in query_buffer:
-                        layer_buf.clear()
-                    continue
 
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
                 if not cfg.ignore_eos and next_token.item() in stop_set:
