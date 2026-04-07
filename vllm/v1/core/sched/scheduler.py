@@ -1279,6 +1279,45 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids
             )
 
+        # ── Speculative Prefill: correct scheduler state ─────────────
+        # The workers may have compressed prompts via spec_prefill.
+        # _update_after_schedule already advanced num_computed_tokens by
+        # old_sched (original scheduled count), but the actual tokens
+        # processed may differ. Correct the request state here.
+        spec_prefill_results = model_runner_output.spec_prefill_results
+        if spec_prefill_results:
+            for req_id, compressed_tokens in spec_prefill_results.items():
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                old_sched = num_scheduled_tokens.get(req_id, 0)
+                compressed_len = len(compressed_tokens)
+                actual_computed = min(compressed_len, old_sched)
+
+                # Fix over-advanced num_computed_tokens.
+                request.num_computed_tokens += actual_computed - old_sched
+
+                # Replace prompt with compressed version.
+                request.prompt_token_ids = compressed_tokens
+                request.num_prompt_tokens = compressed_len
+                request._all_token_ids[:] = compressed_tokens + list(
+                    request._output_token_ids
+                )
+
+                # Recalculate prefill-chunk status.
+                request.is_prefill_chunk = (
+                    request.num_computed_tokens < request.num_tokens
+                )
+
+                # If prefill completed due to compression but the async
+                # scheduler skipped adding output placeholders (because it
+                # was marked as a prefill chunk), add the placeholder now.
+                if (
+                    not request.is_prefill_chunk
+                    and request.num_output_placeholders == 0
+                ):
+                    request.num_output_placeholders += 1
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.

@@ -195,6 +195,12 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # ── Speculative Prefill ──────────────────────────────────────────
+    # req_id -> compressed_token_ids
+    # Sent back from workers so the scheduler can update its view of
+    # the prompt after compression.
+    spec_prefill_results: dict[str, list[int]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

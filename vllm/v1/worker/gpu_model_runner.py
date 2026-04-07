@@ -504,6 +504,9 @@ class GPUModelRunner(
         self._spec_prefill_position_ids: dict[str, list[int]] = {}
         # req_id -> position offset for decode after compressed prefill
         self._spec_prefill_offsets: dict[str, int] = {}
+        # Compression results for the current step, sent to scheduler
+        # via ModelRunnerOutput so it can correct its request state.
+        self._spec_prefill_results: dict[str, list[int]] | None = None
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -940,11 +943,15 @@ class GPUModelRunner(
 
         scheduler_output.total_num_scheduled_tokens -= total_token_delta
 
-        scheduler_output.spec_prefill_compressed_tokens = {
+        self._spec_prefill_results = {
             rid: batch_meta.per_request[rid].compressed_token_ids
             for rid in req_ids
             if rid in batch_meta.per_request
         }
+
+        scheduler_output.spec_prefill_compressed_tokens = (
+            self._spec_prefill_results
+        )
         scheduler_output.spec_prefill_position_ids = {
             rid: batch_meta.per_request[rid].position_ids
             for rid in req_ids
@@ -3878,6 +3885,9 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            spec_prefill_results = self._spec_prefill_results
+            self._spec_prefill_results = None
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3890,6 +3900,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_prefill_results=spec_prefill_results,
             )
 
         if not self.use_async_scheduling:
