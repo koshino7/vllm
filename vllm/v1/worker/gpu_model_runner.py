@@ -934,8 +934,9 @@ class GPUModelRunner(
 
             if new_req.req_id in scheduler_output.num_scheduled_tokens:
                 old_sched = scheduler_output.num_scheduled_tokens[new_req.req_id]
-                scheduler_output.num_scheduled_tokens[new_req.req_id] = new_len
-                total_token_delta += old_sched - new_len
+                new_sched = min(new_len, old_sched)
+                scheduler_output.num_scheduled_tokens[new_req.req_id] = new_sched
+                total_token_delta += old_sched - new_sched
 
         scheduler_output.total_num_scheduled_tokens -= total_token_delta
 
