@@ -218,39 +218,42 @@ class SpecPrefillRunner:
         hooks = self._register_query_hooks(query_buffer)
 
         try:
-            # --- Step 1: prefill full prompt on draft model ---
-            input_ids = torch.tensor(
+            # --- Step 1: prefill prompt on draft model (chunked) ---
+            all_input_ids = torch.tensor(
                 prompt_token_ids, dtype=torch.long, device=self.device
             )
-            positions = torch.arange(
+            all_positions = torch.arange(
                 prompt_len, dtype=torch.long, device=self.device
             )
-            slot_mapping = positions.clone()
             block_table = self._make_block_table(total_len)
 
-            cad = self._build_common_attn_metadata(
-                num_tokens=prompt_len,
-                seq_len=prompt_len,
-                query_len=prompt_len,
-                slot_mapping=slot_mapping,
-                block_table=block_table,
-            )
-            attn_metadata = self._build_attn_metadata(cad)
-            self._run_forward(input_ids, positions, attn_metadata, slot_mapping)
+            chunk_size = self.config.draft_prefill_chunk_size
+            for chunk_start in range(0, prompt_len, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, prompt_len)
+                chunk_ids = all_input_ids[chunk_start:chunk_end]
+                chunk_pos = all_positions[chunk_start:chunk_end]
+                chunk_slots = chunk_pos.clone()
+                chunk_query_len = chunk_end - chunk_start
+                seq_len_so_far = chunk_end
+
+                cad = self._build_common_attn_metadata(
+                    num_tokens=chunk_query_len,
+                    seq_len=seq_len_so_far,
+                    query_len=chunk_query_len,
+                    slot_mapping=chunk_slots,
+                    block_table=block_table,
+                )
+                attn_metadata = self._build_attn_metadata(cad)
+                self._run_forward(
+                    chunk_ids, chunk_pos, attn_metadata, chunk_slots
+                )
 
             # Prefill queries are not useful for importance scoring.
             for buf in query_buffer:
                 buf.clear()
 
-            # Get next token prediction from hidden states.
-            # Re-run model on last token with PADDING slot to avoid
-            # double-writing KV cache.  Use the hidden output from the
-            # prefill to compute logits.
-            # Since vLLM model forward doesn't return hidden states
-            # directly, we use compute_logits on a separate forward
-            # for the last position.
             cur_token_id = self._predict_next_token(
-                input_ids[-1:], positions[-1:], cad, block_table
+                all_input_ids[-1:], all_positions[-1:], cad, block_table
             )
 
             # --- Step 2: look-ahead autoregressive decode ---

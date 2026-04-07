@@ -50,6 +50,10 @@ class SpecPrefillConfig:
     """Kernel size for avg-pool smoothing of token importance scores.
     Set to None to disable smoothing."""
 
+    draft_prefill_chunk_size: int = Field(default=8192, ge=128)
+    """Maximum number of tokens per chunk when feeding the prompt to the
+    draft model.  Keeps attention and MLP intermediate memory bounded."""
+
     ignore_eos: bool = False
     """Ignore EOS tokens during look-ahead. Useful for benchmarking only."""
 
