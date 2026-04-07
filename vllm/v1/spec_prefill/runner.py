@@ -329,7 +329,7 @@ class SpecPrefillRunner:
     ) -> torch.Tensor:
         """Extract prompt-region keys from HF KV cache.
 
-        Returns: ``[num_layers, prompt_len, num_kv_heads, head_dim]``
+        Returns: ``[num_layers, num_kv_heads, prompt_len, head_dim]``
         """
         per_layer = []
         for layer_kv in past_key_values:
@@ -350,8 +350,8 @@ class SpecPrefillRunner:
         """Compute Q*K^T attention scores.
 
         Args:
-            queries: ``[num_layers, look_ahead, hidden_dim]``
-            keys: ``[num_layers, prompt_len, num_kv_heads, head_dim]``
+            queries: ``[num_layers, look_ahead, num_heads * head_dim]``
+            keys: ``[num_layers, num_kv_heads, prompt_len, head_dim]``
 
         Returns:
             ``[num_layers, num_heads, look_ahead, prompt_len]``
@@ -362,12 +362,12 @@ class SpecPrefillRunner:
         q = queries.view(
             num_layers, look_ahead, self._num_heads, self._head_dim
         )
-        q = q.transpose(1, 2)
+        q = q.transpose(1, 2)  # [L, num_heads, look_ahead, D]
 
         repeat_factor = self._num_heads // self._num_kv_heads
-        k = keys.transpose(1, 2)
+        k = keys  # already [L, num_kv_heads, prompt_len, D]
         if repeat_factor > 1:
-            k = k.repeat_interleave(repeat_factor, dim=1)
+            k = k.repeat_interleave(repeat_factor, dim=1)  # [L, num_heads, prompt_len, D]
 
         scale = 1.0 / math.sqrt(self._head_dim)
         attn = torch.matmul(q, k.transpose(-1, -2)) * scale
