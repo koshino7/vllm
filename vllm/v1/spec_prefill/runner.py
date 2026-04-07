@@ -94,7 +94,9 @@ class SpecPrefillRunner:
         self._num_kv_heads = getattr(
             hf_config, "num_key_value_heads", self._num_heads
         )
-        self._head_dim = hf_config.hidden_size // self._num_heads
+        self._head_dim = getattr(
+            hf_config, "head_dim", hf_config.hidden_size // self._num_heads
+        )
         logger.info(
             "Draft model loaded on %s — layers=%d, heads=%d, kv_heads=%d, "
             "head_dim=%d",
@@ -116,32 +118,32 @@ class SpecPrefillRunner:
         """
         assert self.draft_model is not None, "Draft model not loaded"
         cfg = self.config
-        dummy_ids = torch.zeros(
-            (1, max_num_tokens), dtype=torch.long, device=self.device
-        )
+        chunk_sz = cfg.draft_prefill_chunk_size
+
         past_key_values = None
-        for i in range(cfg.look_ahead_cnt + 1):
-            if i == 0:
-                base_out = self.draft_model.model(
-                    input_ids=dummy_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = base_out.past_key_values
-                last_hidden = base_out.last_hidden_state[:, -1:, :]
-                dummy_ids = self.draft_model.lm_head(last_hidden).argmax(
-                    dim=-1
-                )
-                del base_out, last_hidden
-            else:
-                outputs = self.draft_model(
-                    input_ids=dummy_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = outputs.past_key_values
-                dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
-                del outputs
+        for start in range(0, max_num_tokens, chunk_sz):
+            length = min(chunk_sz, max_num_tokens - start)
+            chunk_ids = torch.zeros(
+                (1, length), dtype=torch.long, device=self.device
+            )
+            base_out = self.draft_model.model(
+                input_ids=chunk_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = base_out.past_key_values
+            del base_out, chunk_ids
+
+        dummy_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        for _ in range(cfg.look_ahead_cnt):
+            outputs = self.draft_model(
+                input_ids=dummy_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
+            del outputs
         del past_key_values
         torch.cuda.empty_cache()
 
@@ -175,9 +177,6 @@ class SpecPrefillRunner:
     ) -> SpecPrefillMetadata:
         """Run look-ahead + importance estimation for one request."""
         cfg = self.config
-        input_ids = torch.tensor(
-            [prompt_token_ids], dtype=torch.long, device=self.device
-        )
 
         query_buffer: list[list[torch.Tensor]] = [
             [] for _ in range(self._num_layers)
@@ -185,27 +184,35 @@ class SpecPrefillRunner:
         hooks = self._register_query_hooks(query_buffer)
 
         past_key_values = None
-        cur_input_ids = input_ids
         actual_look_ahead = cfg.look_ahead_cnt
         stop_set = set(cfg.stop_token_ids)
 
         try:
-            for step in range(cfg.look_ahead_cnt + 1):
-                if step == 0:
-                    base_out = self.draft_model.model(
-                        input_ids=cur_input_ids,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
-                    past_key_values = base_out.past_key_values
-                    last_hidden = base_out.last_hidden_state[:, -1:, :]
-                    logits_last = self.draft_model.lm_head(last_hidden)
-                    cur_input_ids = logits_last.argmax(dim=-1)
-                    del base_out, last_hidden, logits_last
-                    for layer_buf in query_buffer:
-                        layer_buf.clear()
-                    continue
+            # --- step 0: chunked prefill through base model (no lm_head) ---
+            chunk_sz = cfg.draft_prefill_chunk_size
+            for start in range(0, len(prompt_token_ids), chunk_sz):
+                chunk = prompt_token_ids[start : start + chunk_sz]
+                chunk_ids = torch.tensor(
+                    [chunk], dtype=torch.long, device=self.device
+                )
+                base_out = self.draft_model.model(
+                    input_ids=chunk_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = base_out.past_key_values
+                last_hidden = base_out.last_hidden_state
+                del base_out
 
+            logits_last = self.draft_model.lm_head(last_hidden[:, -1:, :])
+            cur_input_ids = logits_last.argmax(dim=-1)
+            del last_hidden, logits_last
+
+            for layer_buf in query_buffer:
+                layer_buf.clear()
+
+            # --- steps 1..look_ahead_cnt: autoregressive look-ahead ---
+            for step in range(1, cfg.look_ahead_cnt + 1):
                 outputs = self.draft_model(
                     input_ids=cur_input_ids,
                     past_key_values=past_key_values,

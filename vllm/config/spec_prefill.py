@@ -59,6 +59,10 @@ class SpecPrefillConfig:
     """Token ids treated as stop tokens during the draft model's look-ahead.
     Defaults to Llama-3 family EOS/EOT ids."""
 
+    draft_prefill_chunk_size: int = Field(default=4096, ge=128)
+    """Maximum number of tokens per chunk when feeding the prompt to the
+    draft model. Keeps MLP intermediate activation memory bounded."""
+
     def compute_hash(self) -> str:
         from vllm.utils.hashing import safe_hash
 
