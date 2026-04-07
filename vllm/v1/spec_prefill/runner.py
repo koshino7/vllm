@@ -140,21 +140,22 @@ class SpecPrefillRunner:
             all_attn_names - attn_names_before
         )
 
-        hf_config = draft_model_config.hf_config
-        self._num_layers = hf_config.num_hidden_layers
-        self._num_heads = hf_config.num_attention_heads
-        self._num_kv_heads = getattr(
-            hf_config, "num_key_value_heads", self._num_heads
-        )
-        self._head_dim = getattr(
-            hf_config, "head_dim",
-            hf_config.hidden_size // self._num_heads,
-        )
+        self._num_layers = len(self.draft_attn_layer_names)
         self._block_size = target_vllm_config.cache_config.block_size
 
+        # Read per-rank (TP-sharded) head counts from the actual Attention
+        # modules, NOT from hf_config which has the full-model counts.
+        forward_ctx = (
+            target_vllm_config.compilation_config.static_forward_context
+        )
+        first_attn: Attention = forward_ctx[self.draft_attn_layer_names[0]]
+        self._num_heads = first_attn.num_heads
+        self._num_kv_heads = first_attn.num_kv_heads
+        self._head_dim = first_attn.head_size
+
         logger.info(
-            "Draft model loaded — layers=%d, heads=%d, kv_heads=%d, "
-            "head_dim=%d, draft_attn_layers=%d",
+            "Draft model loaded — layers=%d, heads_per_rank=%d, "
+            "kv_heads_per_rank=%d, head_dim=%d, draft_attn_layers=%d",
             self._num_layers,
             self._num_heads,
             self._num_kv_heads,
