@@ -1,27 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Speculative prefill runner for vLLM v1.
+"""Speculative prefill runner for vLLM v1 — native paged-KV approach.
 
-This module loads a lightweight draft model on the same GPU as the main
-model, runs look-ahead decoding to capture query/key vectors, estimates
-token importance via attention scores, and returns compressed prompt
-metadata to the main model runner.
+This module loads a lightweight draft model through vLLM's own
+``get_model`` (same loader used by ``DraftModelProposer``), so it
+benefits from tensor-parallelism and **paged KV-cache** managed by the
+vLLM memory allocator.  No HuggingFace dynamic cache is involved.
 
-The draft model's weight and activation memory are properly accounted for
-by vLLM's memory profiler (DeviceMemoryProfiler + profile_run) so that
-KV-cache allocation leaves enough headroom.
+Architecture (mirrors the original ``speculative_prefill`` project):
+1.  Draft model processes the full prompt via vLLM paged attention.
+2.  Query vectors captured during look-ahead decode steps via
+    ``register_forward_pre_hook`` on each ``Attention`` module.
+3.  Keys read back from the paged KV-cache tensors.
+4.  Importance scores computed, tokens selected.
+5.  Compressed tokens + original position ids returned to the main
+    model runner.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn as nn
 
-from vllm.config import SpecPrefillConfig
+from vllm.config import SpecPrefillConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.model_loader import get_model
+from vllm.v1.attention.backend import (
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
 from vllm.v1.spec_prefill.compression import (
     compute_token_importance,
     select_kept_indices,
@@ -32,25 +46,22 @@ from vllm.v1.spec_prefill.metadata import (
 )
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedModel
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
 
 class SpecPrefillRunner:
-    """Orchestrates the speculative prefill pipeline.
-
-    The draft model lives on the same GPU as the main model.  Its weight
-    and peak-activation memory are profiled during startup so that the
-    KV-cache allocator reserves enough headroom.
+    """Orchestrates the speculative-prefill pipeline using vLLM-native
+    model loading and paged KV-cache.
 
     Lifecycle
     ---------
-    1. ``load_draft_model``: Load the draft model (GPU, inside
-       DeviceMemoryProfiler).
-    2. ``dummy_run``: Called during ``profile_run`` so that draft-model
-       activation memory is captured by ``torch_peak_increase``.
-    3. ``run``: Called by ``GPUModelRunner`` for each scheduling step that
+    1. ``load_draft_model(vllm_config, runner)`` — called inside
+       ``GPUModelRunner.load_model`` (within ``DeviceMemoryProfiler``).
+    2. After ``initialize_attn_backend`` the runner must call
+       ``init_attn_metadata_builder()`` so we can build proper metadata.
+    3. ``run(req_ids, prompts)`` — called for each scheduling step that
        contains new prefill requests.
     """
 
@@ -63,92 +74,114 @@ class SpecPrefillRunner:
         self.config = config
         self.device = device
         self.dtype = dtype
-        self.draft_model: PreTrainedModel | None = None
+
+        self.model: nn.Module | None = None
+        self.vllm_config: VllmConfig | None = None
+        self.runner: GPUModelRunner | None = None
+
+        # Attention layer book-keeping (populated after load)
+        self.draft_attn_layer_names: list[str] = []
         self._num_layers: int = 0
         self._num_heads: int = 0
         self._num_kv_heads: int = 0
         self._head_dim: int = 0
+        self._block_size: int = 0
+
+        self._attn_metadata_builder: AttentionMetadataBuilder | None = None
 
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
-    def load_draft_model(self) -> None:
-        """Load the draft model onto the same GPU as the main model."""
-        from transformers import AutoModelForCausalLM
+    def load_draft_model(self, target_vllm_config: VllmConfig) -> None:
+        """Load draft model via vLLM ``get_model`` with tensor-parallelism."""
+        from vllm.compilation.backends import set_model_tag
+        from vllm.config import ModelConfig
+
+        target_mc = target_vllm_config.model_config
+
+        draft_model_config = ModelConfig(
+            model=self.config.spec_model,
+            tokenizer=target_mc.tokenizer,
+            tokenizer_mode=target_mc.tokenizer_mode,
+            trust_remote_code=target_mc.trust_remote_code,
+            dtype=target_mc.dtype,
+            seed=target_mc.seed,
+            max_model_len=target_mc.max_model_len,
+        )
+
+        temp_config: VllmConfig = replace(
+            target_vllm_config,
+            model_config=draft_model_config,
+            quant_config=None,
+        )
+        self.vllm_config = target_vllm_config
+
+        attn_names_before = set(
+            get_layers_from_vllm_config(
+                target_vllm_config, Attention,
+            ).keys()
+        )
 
         logger.info(
-            "Loading spec-prefill draft model on %s: %s",
-            self.device,
-            self.config.spec_model,
+            "Loading spec-prefill draft model: %s", self.config.spec_model
         )
-        self.draft_model = AutoModelForCausalLM.from_pretrained(
-            self.config.spec_model,
-            torch_dtype=self.dtype,
-            attn_implementation="sdpa",
-        ).to(self.device)
-        self.draft_model.eval()
+        with set_model_tag("spec_prefill"):
+            self.model = get_model(
+                vllm_config=temp_config,
+                prefix="spec_prefill",
+            )
 
-        hf_config = self.draft_model.config
+        all_attn_names = set(
+            get_layers_from_vllm_config(
+                target_vllm_config, Attention,
+            ).keys()
+        )
+        self.draft_attn_layer_names = sorted(
+            all_attn_names - attn_names_before
+        )
+
+        hf_config = draft_model_config.hf_config
         self._num_layers = hf_config.num_hidden_layers
         self._num_heads = hf_config.num_attention_heads
         self._num_kv_heads = getattr(
             hf_config, "num_key_value_heads", self._num_heads
         )
         self._head_dim = getattr(
-            hf_config, "head_dim", hf_config.hidden_size // self._num_heads
+            hf_config, "head_dim",
+            hf_config.hidden_size // self._num_heads,
         )
+        self._block_size = target_vllm_config.cache_config.block_size
+
         logger.info(
-            "Draft model loaded on %s — layers=%d, heads=%d, kv_heads=%d, "
-            "head_dim=%d",
-            self.device,
+            "Draft model loaded — layers=%d, heads=%d, kv_heads=%d, "
+            "head_dim=%d, draft_attn_layers=%d",
             self._num_layers,
             self._num_heads,
             self._num_kv_heads,
             self._head_dim,
+            len(self.draft_attn_layer_names),
+        )
+
+    def init_attn_metadata_builder(self, runner: GPUModelRunner) -> None:
+        """Locate the AttentionMetadataBuilder for the draft model layers.
+
+        Must be called after ``runner.initialize_attn_backend()``.
+        """
+        self.runner = runner
+        chosen_layer = self.draft_attn_layer_names[0]
+        for kv_cache_group in runner.attn_groups:
+            for attn_group in kv_cache_group:
+                if chosen_layer in attn_group.layer_names:
+                    self._attn_metadata_builder = (
+                        attn_group.get_metadata_builder()
+                    )
+                    return
+        raise RuntimeError(
+            "Could not find AttentionMetadataBuilder for draft model layers"
         )
 
     # ------------------------------------------------------------------
-    # Dummy run for memory profiling
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def dummy_run(self, max_num_tokens: int) -> None:
-        """Run a dummy forward pass so that peak activation memory is
-        captured by ``torch.cuda.max_memory_allocated`` during
-        ``profile_run``.
-        """
-        assert self.draft_model is not None, "Draft model not loaded"
-        cfg = self.config
-        chunk_sz = cfg.draft_prefill_chunk_size
-
-        past_key_values = None
-        for start in range(0, max_num_tokens, chunk_sz):
-            length = min(chunk_sz, max_num_tokens - start)
-            chunk_ids = torch.zeros(
-                (1, length), dtype=torch.long, device=self.device
-            )
-            base_out = self.draft_model.model(
-                input_ids=chunk_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = base_out.past_key_values
-            del base_out, chunk_ids
-
-        dummy_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-        for _ in range(cfg.look_ahead_cnt):
-            outputs = self.draft_model(
-                input_ids=dummy_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = outputs.past_key_values
-            dummy_ids = outputs.logits[:, -1:, :].argmax(dim=-1)
-            del outputs
-        del past_key_values
-        torch.cuda.empty_cache()
-
-    # ------------------------------------------------------------------
-    # Main entry point
+    # Main entry
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def run(
@@ -157,14 +190,13 @@ class SpecPrefillRunner:
         prompt_token_ids_list: list[list[int]],
     ) -> SpecPrefillBatchMetadata:
         """Run speculative prefill for a batch of new prefill requests."""
-        assert self.draft_model is not None, "Draft model not loaded"
+        assert self.model is not None, "Draft model not loaded"
         batch_meta = SpecPrefillBatchMetadata()
 
         for req_id, prompt_token_ids in zip(req_ids, prompt_token_ids_list):
             meta = self._speculate_single(req_id, prompt_token_ids)
             batch_meta.add(meta)
 
-        torch.cuda.empty_cache()
         return batch_meta
 
     # ------------------------------------------------------------------
@@ -175,65 +207,94 @@ class SpecPrefillRunner:
         req_id: str,
         prompt_token_ids: list[int],
     ) -> SpecPrefillMetadata:
-        """Run look-ahead + importance estimation for one request."""
         cfg = self.config
+        prompt_len = len(prompt_token_ids)
+        total_len = prompt_len + cfg.look_ahead_cnt
 
         query_buffer: list[list[torch.Tensor]] = [
             [] for _ in range(self._num_layers)
         ]
         hooks = self._register_query_hooks(query_buffer)
 
-        past_key_values = None
-        actual_look_ahead = cfg.look_ahead_cnt
-        stop_set = set(cfg.stop_token_ids)
-
         try:
-            # --- step 0: chunked prefill through base model (no lm_head) ---
-            chunk_sz = cfg.draft_prefill_chunk_size
-            for start in range(0, len(prompt_token_ids), chunk_sz):
-                chunk = prompt_token_ids[start : start + chunk_sz]
-                chunk_ids = torch.tensor(
-                    [chunk], dtype=torch.long, device=self.device
+            # --- Step 1: prefill full prompt on draft model ---
+            input_ids = torch.tensor(
+                prompt_token_ids, dtype=torch.long, device=self.device
+            )
+            positions = torch.arange(
+                prompt_len, dtype=torch.long, device=self.device
+            )
+            slot_mapping = positions.clone()
+            block_table = self._make_block_table(total_len)
+
+            cad = self._build_common_attn_metadata(
+                num_tokens=prompt_len,
+                seq_len=prompt_len,
+                query_len=prompt_len,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+            )
+            attn_metadata = self._build_attn_metadata(cad)
+            self._run_forward(input_ids, positions, attn_metadata, slot_mapping)
+
+            # Prefill queries are not useful for importance scoring.
+            for buf in query_buffer:
+                buf.clear()
+
+            # Get next token prediction from hidden states.
+            # Re-run model on last token with PADDING slot to avoid
+            # double-writing KV cache.  Use the hidden output from the
+            # prefill to compute logits.
+            # Since vLLM model forward doesn't return hidden states
+            # directly, we use compute_logits on a separate forward
+            # for the last position.
+            cur_token_id = self._predict_next_token(
+                input_ids[-1:], positions[-1:], cad, block_table
+            )
+
+            # --- Step 2: look-ahead autoregressive decode ---
+            actual_look_ahead = cfg.look_ahead_cnt
+            stop_set = set(cfg.stop_token_ids)
+            seq_len = prompt_len
+
+            for step in range(cfg.look_ahead_cnt):
+                decode_pos = torch.tensor(
+                    [seq_len], dtype=torch.long, device=self.device
                 )
-                base_out = self.draft_model.model(
-                    input_ids=chunk_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
+                decode_slot = decode_pos.clone()
+
+                decode_cad = self._build_common_attn_metadata(
+                    num_tokens=1,
+                    seq_len=seq_len + 1,
+                    query_len=1,
+                    slot_mapping=decode_slot,
+                    block_table=block_table,
                 )
-                past_key_values = base_out.past_key_values
-                last_hidden = base_out.last_hidden_state
-                del base_out
+                decode_attn = self._build_attn_metadata(decode_cad)
 
-            logits_last = self.draft_model.lm_head(last_hidden[:, -1:, :])
-            cur_input_ids = logits_last.argmax(dim=-1)
-            del last_hidden, logits_last
-
-            for layer_buf in query_buffer:
-                layer_buf.clear()
-
-            # --- steps 1..look_ahead_cnt: autoregressive look-ahead ---
-            for step in range(1, cfg.look_ahead_cnt + 1):
-                outputs = self.draft_model(
-                    input_ids=cur_input_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
+                decode_ids = cur_token_id.unsqueeze(0)
+                self._run_forward(
+                    decode_ids, decode_pos, decode_attn, decode_slot
                 )
-                past_key_values = outputs.past_key_values
+                seq_len += 1
 
-                next_token = outputs.logits[:, -1, :].argmax(dim=-1)
-                if not cfg.ignore_eos and next_token.item() in stop_set:
-                    actual_look_ahead = step
+                next_token_id = self._predict_next_token(
+                    decode_ids, decode_pos, decode_cad, block_table
+                )
+
+                if not cfg.ignore_eos and next_token_id.item() in stop_set:
+                    actual_look_ahead = step + 1
                     break
-                cur_input_ids = next_token.unsqueeze(0)
+                cur_token_id = next_token_id
+
         finally:
             for h in hooks:
                 h.remove()
 
-        all_keys = self._collect_keys_from_cache(
-            past_key_values, len(prompt_token_ids)
-        )
-        del past_key_values, outputs
+        # --- Step 3: read keys from paged KV-cache ---
+        all_keys = self._collect_keys_from_paged_cache(prompt_len)
 
+        # --- Step 4: compute importance and select ---
         all_queries = self._collect_queries(query_buffer, actual_look_ahead)
 
         all_queries = all_queries.cpu()
@@ -242,11 +303,9 @@ class SpecPrefillRunner:
         attn_scores = self._compute_attention_scores(
             all_queries, all_keys, actual_look_ahead
         )
-
         importance = compute_token_importance(
             attn_scores, pool_kernel_size=cfg.pool_kernel_size
         )
-
         kept_indices = select_kept_indices(
             importance,
             keep_percentage=cfg.keep_percentage,
@@ -259,10 +318,125 @@ class SpecPrefillRunner:
 
         return SpecPrefillMetadata(
             req_id=req_id,
-            original_prompt_len=len(prompt_token_ids),
+            original_prompt_len=prompt_len,
             compressed_token_ids=compressed_tokens,
             position_ids=kept_indices_cpu,
         )
+
+    # ------------------------------------------------------------------
+    # Attention metadata helpers
+    # ------------------------------------------------------------------
+    def _make_block_table(self, max_seq_len: int) -> torch.Tensor:
+        """Sequential block table for our private draft-model KV pool."""
+        num_blocks = (max_seq_len + self._block_size - 1) // self._block_size
+        return torch.arange(
+            num_blocks, dtype=torch.int32, device=self.device
+        ).unsqueeze(0)
+
+    def _build_common_attn_metadata(
+        self,
+        num_tokens: int,
+        seq_len: int,
+        query_len: int,
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> CommonAttentionMetadata:
+        return CommonAttentionMetadata(
+            query_start_loc=torch.tensor(
+                [0, query_len], dtype=torch.int32, device=self.device
+            ),
+            query_start_loc_cpu=torch.tensor(
+                [0, query_len], dtype=torch.int32
+            ),
+            seq_lens=torch.tensor(
+                [seq_len], dtype=torch.int32, device=self.device
+            ),
+            num_reqs=1,
+            num_actual_tokens=num_tokens,
+            max_query_len=query_len,
+            max_seq_len=seq_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+        )
+
+    def _build_attn_metadata(self, cad: CommonAttentionMetadata):
+        assert self._attn_metadata_builder is not None
+        return self._attn_metadata_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=cad,
+            fast_build=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Draft-model forward helpers
+    # ------------------------------------------------------------------
+    def _run_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Run the draft model forward under ``set_forward_context``."""
+        assert self.vllm_config is not None
+        num_tokens = input_ids.shape[0]
+
+        per_layer_attn_metadata: dict = {}
+        for layer_name in self.draft_attn_layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+
+        slot_mapping_dict: dict[str, torch.Tensor] = {}
+        for layer_name in self.draft_attn_layer_names:
+            slot_mapping_dict[layer_name] = slot_mapping
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            slot_mapping=slot_mapping_dict,
+        ):
+            self.model(input_ids=input_ids, positions=positions)
+
+    def _predict_next_token(
+        self,
+        last_ids: torch.Tensor,
+        last_pos: torch.Tensor,
+        cad: CommonAttentionMetadata,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a read-only forward on the last token to get logits.
+
+        Uses PADDING_SLOT_ID (-1) so no KV-cache is modified.
+        """
+        assert self.vllm_config is not None
+        PAD = -1
+        pad_slot = torch.full_like(last_pos, PAD)
+
+        pad_cad = self._build_common_attn_metadata(
+            num_tokens=1,
+            seq_len=cad.seq_lens[0].item(),
+            query_len=1,
+            slot_mapping=pad_slot,
+            block_table=block_table,
+        )
+        pad_attn = self._build_attn_metadata(pad_cad)
+
+        per_layer_attn_metadata: dict = {}
+        slot_mapping_dict: dict[str, torch.Tensor] = {}
+        for layer_name in self.draft_attn_layer_names:
+            per_layer_attn_metadata[layer_name] = pad_attn
+            slot_mapping_dict[layer_name] = pad_slot
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=1,
+            slot_mapping=slot_mapping_dict,
+        ):
+            hidden = self.model(input_ids=last_ids, positions=last_pos)
+
+        logits = self.model.compute_logits(hidden)
+        return logits.argmax(dim=-1).squeeze(0)
 
     # ------------------------------------------------------------------
     # Query hook registration
@@ -271,32 +445,27 @@ class SpecPrefillRunner:
         self,
         query_buffer: list[list[torch.Tensor]],
     ) -> list[torch.utils.hooks.RemovableHook]:
-        """Register forward hooks to capture the last token's Q per layer."""
+        """Register pre-hooks on draft-model ``Attention`` to capture Q."""
+        assert self.vllm_config is not None
         hooks: list[torch.utils.hooks.RemovableHook] = []
-        for layer_idx, layer in enumerate(
-            self.draft_model.model.layers  # type: ignore[union-attr]
-        ):
-            attn_module = layer.self_attn
 
-            def _hook(
-                module: torch.nn.Module,
+        forward_ctx = (
+            self.vllm_config.compilation_config.static_forward_context
+        )
+
+        for layer_idx, layer_name in enumerate(self.draft_attn_layer_names):
+            attn_module = forward_ctx[layer_name]
+
+            def _pre_hook(
+                module: nn.Module,
                 args: tuple,
-                kwargs: dict,
-                output: object,
                 buf: list[list[torch.Tensor]] = query_buffer,
                 idx: int = layer_idx,
             ) -> None:
-                if args:
-                    hidden = args[0]
-                else:
-                    hidden = kwargs.get("hidden_states")
-                if hidden is None:
-                    return
-                last_hidden = hidden[:, -1:, :]
-                q_last = module.q_proj(last_hidden)  # type: ignore[attr-defined]
-                buf[idx].append(q_last.detach())
+                query = args[0]  # post-RoPE: [num_tokens, num_heads*head_dim]
+                buf[idx].append(query[-1:].detach().clone())
 
-            h = attn_module.register_forward_hook(_hook, with_kwargs=True)
+            h = attn_module.register_forward_pre_hook(_pre_hook)
             hooks.append(h)
         return hooks
 
@@ -308,35 +477,53 @@ class SpecPrefillRunner:
         query_buffer: list[list[torch.Tensor]],
         actual_look_ahead: int,
     ) -> torch.Tensor:
-        """Stack captured queries into ``[num_layers, look_ahead, H*D]``."""
+        """Stack queries: ``[num_layers, look_ahead, num_heads*head_dim]``."""
         per_layer = []
         for layer_bufs in query_buffer:
             qs = layer_bufs[:actual_look_ahead]
             if qs:
-                per_layer.append(torch.cat(qs, dim=1))
+                per_layer.append(torch.cat(qs, dim=0))
             else:
                 per_layer.append(
-                    layer_bufs[0]
-                    if layer_bufs
-                    else torch.zeros(1, 1, self._num_heads * self._head_dim)
+                    torch.zeros(
+                        1, self._num_heads * self._head_dim,
+                        device=self.device, dtype=self.dtype,
+                    )
                 )
-        return torch.stack(per_layer, dim=0).squeeze(1)
+        return torch.stack(per_layer, dim=0)
 
-    def _collect_keys_from_cache(
+    def _collect_keys_from_paged_cache(
         self,
-        past_key_values: tuple,
         prompt_len: int,
     ) -> torch.Tensor:
-        """Extract prompt-region keys from HF KV cache.
+        """Read prompt-region keys from draft-model paged KV-cache.
 
         Returns: ``[num_layers, num_kv_heads, prompt_len, head_dim]``
         """
+        assert self.vllm_config is not None
+        forward_ctx = (
+            self.vllm_config.compilation_config.static_forward_context
+        )
+        bs = self._block_size
+
+        slot_indices = torch.arange(prompt_len, device=self.device)
+        block_indices = slot_indices // bs
+        block_offsets = slot_indices % bs
+
         per_layer = []
-        for layer_kv in past_key_values:
-            k = layer_kv[0]  # [batch, num_kv_heads, total_len, head_dim]
-            k_prompt = k[:, :, :prompt_len, :].squeeze(0).contiguous()
-            per_layer.append(k_prompt)
-        return torch.stack(per_layer, dim=0)
+        for layer_name in self.draft_attn_layer_names:
+            attn_layer: Attention = forward_ctx[layer_name]
+            kv_cache = attn_layer.kv_cache[0]
+            # Standard layout: [2, num_blocks, block_size, num_kv_heads, head_dim]
+            if kv_cache.dim() == 5 and kv_cache.shape[0] == 2:
+                key_cache = kv_cache[0]
+            else:
+                key_cache = kv_cache
+            keys = key_cache[block_indices, block_offsets]
+            per_layer.append(keys)
+
+        stacked = torch.stack(per_layer, dim=0)
+        return stacked.transpose(1, 2).contiguous()
 
     # ------------------------------------------------------------------
     # Attention score computation
@@ -362,12 +549,12 @@ class SpecPrefillRunner:
         q = queries.view(
             num_layers, look_ahead, self._num_heads, self._head_dim
         )
-        q = q.transpose(1, 2)  # [L, num_heads, look_ahead, D]
+        q = q.transpose(1, 2)
 
         repeat_factor = self._num_heads // self._num_kv_heads
-        k = keys  # already [L, num_kv_heads, prompt_len, D]
+        k = keys
         if repeat_factor > 1:
-            k = k.repeat_interleave(repeat_factor, dim=1)  # [L, num_heads, prompt_len, D]
+            k = k.repeat_interleave(repeat_factor, dim=1)
 
         scale = 1.0 / math.sqrt(self._head_dim)
         attn = torch.matmul(q, k.transpose(-1, -2)) * scale

@@ -27,6 +27,13 @@ class SpecPrefillMetadata:
     def compressed_len(self) -> int:
         return len(self.compressed_token_ids)
 
+    @property
+    def position_offset(self) -> int:
+        """Offset to add to ``num_computed_tokens`` during decode to obtain
+        the correct RoPE position.  Equal to
+        ``original_prompt_len - compressed_len``."""
+        return self.original_prompt_len - self.compressed_len
+
 
 @dataclass
 class SpecPrefillBatchMetadata:

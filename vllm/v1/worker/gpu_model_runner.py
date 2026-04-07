@@ -502,6 +502,8 @@ class GPUModelRunner(
             )
         # req_id -> original position ids for compressed prompts
         self._spec_prefill_position_ids: dict[str, list[int]] = {}
+        # req_id -> position offset for decode after compressed prefill
+        self._spec_prefill_offsets: dict[str, int] = {}
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -926,6 +928,10 @@ class GPUModelRunner(
             new_len = len(meta.compressed_token_ids)
 
             self._spec_prefill_position_ids[new_req.req_id] = meta.position_ids
+            if meta.position_offset > 0:
+                self._spec_prefill_offsets[new_req.req_id] = (
+                    meta.position_offset
+                )
 
             delta = old_len - new_len
             total_token_delta += delta
@@ -963,6 +969,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._spec_prefill_offsets.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1567,9 +1574,12 @@ class GPUModelRunner(
             out=positions_np,
         )
 
-        # Override positions for spec-prefill compressed prompts so that
-        # the model sees the original (non-contiguous) position ids.
-        if self._spec_prefill_position_ids:
+        # Override positions for spec-prefill requests.
+        # During compressed prefill: use the original (non-contiguous)
+        # position ids of the selected tokens.
+        # During decode after compressed prefill: add position_offset so
+        # that RoPE sees the correct absolute position.
+        if self._spec_prefill_position_ids or self._spec_prefill_offsets:
             offset = 0
             for req_idx in range(num_reqs):
                 n_tokens = num_scheduled_tokens[req_idx]
@@ -1580,6 +1590,10 @@ class GPUModelRunner(
                         pos_ids[:n_tokens], dtype=positions_np.dtype
                     )
                     del self._spec_prefill_position_ids[req_id]
+                elif req_id in self._spec_prefill_offsets:
+                    positions_np[offset : offset + n_tokens] += (
+                        self._spec_prefill_offsets[req_id]
+                    )
                 offset += n_tokens
 
         # Calculate M-RoPE positions.
@@ -4302,7 +4316,7 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
                 if self.spec_prefill_runner is not None:
-                    self.spec_prefill_runner.load_draft_model()
+                    self.spec_prefill_runner.load_draft_model(self.vllm_config)
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -5278,13 +5292,6 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
-        if self.spec_prefill_runner is not None:
-            draft_profile_len = min(
-                self.max_model_len,
-                self.spec_prefill_runner.draft_model.config.max_position_embeddings,
-            )
-            self.spec_prefill_runner.dummy_run(draft_profile_len)
-
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -6169,6 +6176,9 @@ class GPUModelRunner(
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        if self.spec_prefill_runner is not None:
+            self.spec_prefill_runner.init_attn_metadata_builder(self)
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
