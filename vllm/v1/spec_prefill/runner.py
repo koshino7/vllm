@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import SpecPrefillConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -36,10 +37,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.spec_prefill.compression import (
-    compute_token_importance,
-    select_kept_indices,
-)
+from vllm.v1.spec_prefill.compression import select_kept_indices
 from vllm.v1.spec_prefill.metadata import (
     SpecPrefillBatchMetadata,
     SpecPrefillMetadata,
@@ -88,6 +86,20 @@ class SpecPrefillRunner:
         self._block_size: int = 0
 
         self._attn_metadata_builder: AttentionMetadataBuilder | None = None
+
+        # Pre-allocated reusable tensors for single-request metadata
+        # (avoids per-call torch.tensor → H2D copies).
+        self._qsl_gpu = torch.zeros(2, dtype=torch.int32, device=device)
+        self._qsl_cpu = torch.zeros(2, dtype=torch.int32)
+        self._seq_lens_1 = torch.zeros(1, dtype=torch.int32, device=device)
+        # Constant decode-phase tensors (query_len == 1).
+        self._decode_qsl_gpu = torch.tensor(
+            [0, 1], dtype=torch.int32, device=device
+        )
+        self._decode_qsl_cpu = torch.tensor([0, 1], dtype=torch.int32)
+        self._pad_slot_1 = torch.tensor(
+            [-1], dtype=torch.long, device=device
+        )
 
     # ------------------------------------------------------------------
     # Model loading
@@ -190,155 +202,304 @@ class SpecPrefillRunner:
         req_ids: list[str],
         prompt_token_ids_list: list[list[int]],
     ) -> SpecPrefillBatchMetadata:
-        """Run speculative prefill for a batch of new prefill requests."""
+        """Run speculative prefill for a batch of new prefill requests.
+
+        All TP ranks execute the draft-model forward (required for TP
+        correctness), but only rank 0 performs scoring & compression.
+        Results are broadcast to the other ranks.
+        """
         assert self.model is not None, "Draft model not loaded"
+        cfg = self.config
         batch_meta = SpecPrefillBatchMetadata()
+        tp = get_tp_group()
+        is_rank0 = tp.rank_in_group == 0
 
-        for req_id, prompt_token_ids in zip(req_ids, prompt_token_ids_list):
-            meta = self._speculate_single(req_id, prompt_token_ids)
-            batch_meta.add(meta)
+        eligible: list[tuple[str, list[int]]] = [
+            (rid, ptids)
+            for rid, ptids in zip(req_ids, prompt_token_ids_list)
+            if len(ptids) >= cfg.min_prompt_len
+        ]
+        if not eligible:
+            return batch_meta
 
+        e_prompts = [p for _, p in eligible]
+
+        # Phase 1+2: all ranks run the draft model (prefill + decode).
+        query_buffers, actual_look_aheads, prompt_lens, blk_offsets = (
+            self._run_draft_forward_batch(e_prompts)
+        )
+
+        # Phase 2b: rank 0 scores and compresses.
+        per_req_results: list[tuple[list[int], list[int], int]] = []
+        if is_rank0:
+            for i, (_, ptids) in enumerate(eligible):
+                all_queries = self._collect_queries(
+                    query_buffers[i], actual_look_aheads[i]
+                )
+                importance = self._compute_importance_gpu(
+                    all_queries, prompt_lens[i], cfg.pool_kernel_size,
+                    slot_offset=blk_offsets[i] * self._block_size,
+                )
+                kept_indices = select_kept_indices(
+                    importance,
+                    keep_percentage=cfg.keep_percentage,
+                    chunk_selection=cfg.chunk_selection,
+                    chunk_size=cfg.chunk_size,
+                )
+                kept_cpu = kept_indices.tolist()
+                compressed = [ptids[j] for j in kept_cpu]
+                per_req_results.append(
+                    (compressed, kept_cpu, prompt_lens[i])
+                )
+
+        # Phase 3: rank 0 broadcasts compression results.
+        if tp.world_size > 1:
+            bcast: list = [per_req_results if is_rank0 else None]
+            tp.broadcast_object_list(bcast, src=0)
+            if not is_rank0:
+                per_req_results = bcast[0]
+
+        # Build metadata (all ranks).
+        for (req_id, _), (compressed, pos_ids, orig_len) in zip(
+            eligible, per_req_results
+        ):
+            batch_meta.add(
+                SpecPrefillMetadata(
+                    req_id=req_id,
+                    original_prompt_len=orig_len,
+                    compressed_token_ids=compressed,
+                    position_ids=pos_ids,
+                )
+            )
         return batch_meta
 
     # ------------------------------------------------------------------
-    # Per-request speculation
+    # Draft-model forward — batched across requests (all TP ranks)
     # ------------------------------------------------------------------
-    def _speculate_single(
+    def _run_draft_forward_batch(
         self,
-        req_id: str,
-        prompt_token_ids: list[int],
-    ) -> SpecPrefillMetadata:
+        prompts: list[list[int]],
+    ) -> tuple[
+        list[list[list[torch.Tensor]]],  # per-request query buffers
+        list[int],                        # per-request actual_look_ahead
+        list[int],                        # per-request prompt_len
+        list[int],                        # per-request block_offset
+    ]:
+        """Run draft-model prefill + batched look-ahead decode.
+
+        Prefill is still per-request (large chunks are compute-bound).
+        Look-ahead decode is batched: 8 forward passes with N tokens
+        instead of 8*N separate forward passes.
+        """
         cfg = self.config
-        prompt_len = len(prompt_token_ids)
-        total_len = prompt_len + cfg.look_ahead_cnt
+        N = len(prompts)
+        prompt_lens = [len(p) for p in prompts]
 
-        query_buffer: list[list[torch.Tensor]] = [
-            [] for _ in range(self._num_layers)
+        # Allocate non-overlapping block regions per request.
+        block_offsets: list[int] = []
+        block_tables: list[torch.Tensor] = []
+        cur_block = 0
+        for plen in prompt_lens:
+            total_len = plen + cfg.look_ahead_cnt
+            num_blocks = (total_len + self._block_size - 1) // self._block_size
+            bt = torch.arange(
+                cur_block, cur_block + num_blocks,
+                dtype=torch.int32, device=self.device,
+            ).unsqueeze(0)
+            block_tables.append(bt)
+            block_offsets.append(cur_block)
+            cur_block += num_blocks
+
+        # Per-request query buffers (only used during decode).
+        query_buffers: list[list[list[torch.Tensor]]] = [
+            [[] for _ in range(self._num_layers)] for _ in range(N)
         ]
-        hooks = self._register_query_hooks(query_buffer)
 
-        try:
-            # --- Step 1: prefill prompt on draft model (chunked) ---
-            all_input_ids = torch.tensor(
-                prompt_token_ids, dtype=torch.long, device=self.device
+        # ----------------------------------------------------------
+        # Phase 1: per-request chunked prefill (no hooks needed)
+        # ----------------------------------------------------------
+        chunk_size = cfg.draft_prefill_chunk_size
+        for i in range(N):
+            input_ids = torch.tensor(
+                prompts[i], dtype=torch.long, device=self.device
             )
-            all_positions = torch.arange(
-                prompt_len, dtype=torch.long, device=self.device
+            positions = torch.arange(
+                prompt_lens[i], dtype=torch.long, device=self.device
             )
-            block_table = self._make_block_table(total_len)
+            slot_base = block_offsets[i] * self._block_size
 
-            chunk_size = self.config.draft_prefill_chunk_size
-            for chunk_start in range(0, prompt_len, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, prompt_len)
-                chunk_ids = all_input_ids[chunk_start:chunk_end]
-                chunk_pos = all_positions[chunk_start:chunk_end]
-                chunk_slots = chunk_pos.clone()
-                chunk_query_len = chunk_end - chunk_start
-                seq_len_so_far = chunk_end
+            for chunk_start in range(0, prompt_lens[i], chunk_size):
+                chunk_end = min(chunk_start + chunk_size, prompt_lens[i])
+                chunk_ids = input_ids[chunk_start:chunk_end]
+                chunk_pos = positions[chunk_start:chunk_end]
+                chunk_slots = chunk_pos + slot_base
+                qlen = chunk_end - chunk_start
 
-                cad = self._build_common_attn_metadata(
-                    num_tokens=chunk_query_len,
-                    seq_len=seq_len_so_far,
-                    query_len=chunk_query_len,
+                cad = self._cad_single(
+                    num_tokens=qlen,
+                    seq_len=chunk_end,
+                    query_len=qlen,
                     slot_mapping=chunk_slots,
-                    block_table=block_table,
+                    block_table=block_tables[i],
                 )
                 attn_metadata = self._build_attn_metadata(cad)
-                self._run_forward(
-                    chunk_ids, chunk_pos, attn_metadata, chunk_slots
+                self._run_forward(chunk_ids, chunk_pos, attn_metadata,
+                                  chunk_slots)
+
+        # Get initial next-token for each request.
+        cur_tokens: list[torch.Tensor] = []
+        for i in range(N):
+            last_id = torch.tensor(
+                [prompts[i][-1]], dtype=torch.long, device=self.device
+            )
+            last_pos = torch.tensor(
+                [prompt_lens[i] - 1], dtype=torch.long, device=self.device
+            )
+            cad_last = self._cad_single_decode(
+                seq_len=prompt_lens[i],
+                slot_mapping=self._pad_slot_1,
+                block_table=block_tables[i],
+            )
+            cur_tokens.append(
+                self._predict_next_token(
+                    last_id, last_pos, cad_last, block_tables[i]
                 )
-
-            # Prefill queries are not useful for importance scoring.
-            for buf in query_buffer:
-                buf.clear()
-
-            cur_token_id = self._predict_next_token(
-                all_input_ids[-1:], all_positions[-1:], cad, block_table
             )
 
-            # --- Step 2: look-ahead autoregressive decode ---
-            actual_look_ahead = cfg.look_ahead_cnt
-            stop_set = set(cfg.stop_token_ids)
-            seq_len = prompt_len
+        # ----------------------------------------------------------
+        # Phase 2: batched look-ahead decode with per-request hooks
+        # ----------------------------------------------------------
+        self._batched_hook_buffers = query_buffers
+        self._batched_hook_N = N
+        hooks = self._register_batched_query_hooks()
 
+        actual_look_aheads = [cfg.look_ahead_cnt] * N
+        stop_set = set(cfg.stop_token_ids)
+        seq_lens = list(prompt_lens)  # mutable copy
+        active = list(range(N))       # indices of still-active requests
+
+        # Pre-allocate decode buffers sized for max batch (N).
+        max_bt_cols = max(bt.shape[1] for bt in block_tables)
+        buf_ids = torch.empty(N, dtype=torch.long, device=self.device)
+        buf_pos = torch.empty(N, dtype=torch.long, device=self.device)
+        buf_slots = torch.empty(N, dtype=torch.long, device=self.device)
+        buf_seq_lens = torch.empty(N, dtype=torch.int32, device=self.device)
+        buf_qsl_gpu = torch.arange(
+            N + 1, dtype=torch.int32, device=self.device
+        )
+        buf_qsl_cpu = torch.arange(N + 1, dtype=torch.int32)
+        buf_bt = torch.zeros(
+            N, max_bt_cols, dtype=torch.int32, device=self.device
+        )
+        buf_pad_slots = torch.full(
+            (N,), -1, dtype=torch.long, device=self.device
+        )
+        # Fill block table rows once (only changes if requests drop out).
+        for j in range(N):
+            cols = block_tables[j].shape[1]
+            buf_bt[j, :cols] = block_tables[j][0]
+
+        try:
             for step in range(cfg.look_ahead_cnt):
-                decode_pos = torch.tensor(
-                    [seq_len], dtype=torch.long, device=self.device
-                )
-                decode_slot = decode_pos.clone()
-
-                decode_cad = self._build_common_attn_metadata(
-                    num_tokens=1,
-                    seq_len=seq_len + 1,
-                    query_len=1,
-                    slot_mapping=decode_slot,
-                    block_table=block_table,
-                )
-                decode_attn = self._build_attn_metadata(decode_cad)
-
-                decode_ids = cur_token_id.unsqueeze(0)
-                self._run_forward(
-                    decode_ids, decode_pos, decode_attn, decode_slot
-                )
-                seq_len += 1
-
-                next_token_id = self._predict_next_token(
-                    decode_ids, decode_pos, decode_cad, block_table
-                )
-
-                if not cfg.ignore_eos and next_token_id.item() in stop_set:
-                    actual_look_ahead = step + 1
+                if not active:
                     break
-                cur_token_id = next_token_id
+
+                na = len(active)
+                for j, a in enumerate(active):
+                    buf_ids[j] = cur_tokens[a]
+                    buf_pos[j] = seq_lens[a]
+                    buf_slots[j] = (
+                        block_offsets[a] * self._block_size + seq_lens[a]
+                    )
+                    buf_seq_lens[j] = seq_lens[a] + 1
+
+                # Rebuild padded block-table only for active subset.
+                act_bt = buf_bt[:na]
+                if na < N:
+                    act_bt = act_bt.clone()
+                    for j, a in enumerate(active):
+                        cols = block_tables[a].shape[1]
+                        act_bt[j].zero_()
+                        act_bt[j, :cols] = block_tables[a][0]
+
+                ids_v = buf_ids[:na]
+                pos_v = buf_pos[:na]
+                slots_v = buf_slots[:na]
+                sls_v = buf_seq_lens[:na]
+                qsl_v = buf_qsl_gpu[: na + 1]
+                qsl_cpu_v = buf_qsl_cpu[: na + 1]
+                max_sl = int(sls_v.max().item())
+
+                cad = CommonAttentionMetadata(
+                    query_start_loc=qsl_v,
+                    query_start_loc_cpu=qsl_cpu_v,
+                    seq_lens=sls_v,
+                    num_reqs=na,
+                    num_actual_tokens=na,
+                    max_query_len=1,
+                    max_seq_len=max_sl,
+                    block_table_tensor=act_bt,
+                    slot_mapping=slots_v,
+                )
+                attn_metadata = self._build_attn_metadata(cad)
+
+                self._batched_hook_active = active
+                self._hooks_enabled = True
+                self._run_forward(ids_v, pos_v, attn_metadata, slots_v)
+                self._hooks_enabled = False
+
+                for j, a in enumerate(active):
+                    seq_lens[a] += 1
+
+                # Predict next tokens (batched, padding slot, no KV write).
+                pad_v = buf_pad_slots[:na]
+                pad_cad = CommonAttentionMetadata(
+                    query_start_loc=qsl_v,
+                    query_start_loc_cpu=qsl_cpu_v,
+                    seq_lens=sls_v,
+                    num_reqs=na,
+                    num_actual_tokens=na,
+                    max_query_len=1,
+                    max_seq_len=max_sl,
+                    block_table_tensor=act_bt,
+                    slot_mapping=pad_v,
+                )
+                pad_attn = self._build_attn_metadata(pad_cad)
+                per_layer_meta: dict = {}
+                slot_dict: dict[str, torch.Tensor] = {}
+                for ln in self.draft_attn_layer_names:
+                    per_layer_meta[ln] = pad_attn
+                    slot_dict[ln] = pad_v
+                with set_forward_context(
+                    per_layer_meta, self.vllm_config,
+                    num_tokens=na, slot_mapping=slot_dict,
+                ):
+                    hidden = self.model(
+                        input_ids=ids_v, positions=pos_v,
+                    )
+                logits = self.model.compute_logits(hidden)
+                next_ids = logits.argmax(dim=-1)
+
+                still_active = []
+                for j, a in enumerate(active):
+                    nid = next_ids[j]
+                    if not cfg.ignore_eos and nid.item() in stop_set:
+                        actual_look_aheads[a] = step + 1
+                    else:
+                        cur_tokens[a] = nid
+                        still_active.append(a)
+                active = still_active
 
         finally:
             for h in hooks:
                 h.remove()
 
-        # --- Step 3: read keys from paged KV-cache ---
-        all_keys = self._collect_keys_from_paged_cache(prompt_len)
-
-        # --- Step 4: compute importance and select ---
-        all_queries = self._collect_queries(query_buffer, actual_look_ahead)
-
-        all_queries = all_queries.cpu()
-        if all_keys.device.type != "cpu":
-            all_keys = all_keys.cpu()
-
-        attn_scores = self._compute_attention_scores(
-            all_queries, all_keys, actual_look_ahead
-        )
-        importance = compute_token_importance(
-            attn_scores, pool_kernel_size=cfg.pool_kernel_size
-        )
-        kept_indices = select_kept_indices(
-            importance,
-            keep_percentage=cfg.keep_percentage,
-            chunk_selection=cfg.chunk_selection,
-            chunk_size=cfg.chunk_size,
-        )
-
-        kept_indices_cpu = kept_indices.tolist()
-        compressed_tokens = [prompt_token_ids[i] for i in kept_indices_cpu]
-
-        return SpecPrefillMetadata(
-            req_id=req_id,
-            original_prompt_len=prompt_len,
-            compressed_token_ids=compressed_tokens,
-            position_ids=kept_indices_cpu,
-        )
+        return query_buffers, actual_look_aheads, prompt_lens, block_offsets
 
     # ------------------------------------------------------------------
-    # Attention metadata helpers
+    # Attention metadata helpers (zero-allocation fast paths)
     # ------------------------------------------------------------------
-    def _make_block_table(self, max_seq_len: int) -> torch.Tensor:
-        """Sequential block table for our private draft-model KV pool."""
-        num_blocks = (max_seq_len + self._block_size - 1) // self._block_size
-        return torch.arange(
-            num_blocks, dtype=torch.int32, device=self.device
-        ).unsqueeze(0)
-
-    def _build_common_attn_metadata(
+    def _cad_single(
         self,
         num_tokens: int,
         seq_len: int,
@@ -346,19 +507,37 @@ class SpecPrefillRunner:
         slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
     ) -> CommonAttentionMetadata:
+        """Build single-request CAD by filling pre-allocated buffers."""
+        self._qsl_gpu[1] = query_len
+        self._qsl_cpu[1] = query_len
+        self._seq_lens_1[0] = seq_len
         return CommonAttentionMetadata(
-            query_start_loc=torch.tensor(
-                [0, query_len], dtype=torch.int32, device=self.device
-            ),
-            query_start_loc_cpu=torch.tensor(
-                [0, query_len], dtype=torch.int32
-            ),
-            seq_lens=torch.tensor(
-                [seq_len], dtype=torch.int32, device=self.device
-            ),
+            query_start_loc=self._qsl_gpu,
+            query_start_loc_cpu=self._qsl_cpu,
+            seq_lens=self._seq_lens_1,
             num_reqs=1,
             num_actual_tokens=num_tokens,
             max_query_len=query_len,
+            max_seq_len=seq_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+        )
+
+    def _cad_single_decode(
+        self,
+        seq_len: int,
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> CommonAttentionMetadata:
+        """Decode fast-path: query_len=1, no tensor creation at all."""
+        self._seq_lens_1[0] = seq_len
+        return CommonAttentionMetadata(
+            query_start_loc=self._decode_qsl_gpu,
+            query_start_loc_cpu=self._decode_qsl_cpu,
+            seq_lens=self._seq_lens_1,
+            num_reqs=1,
+            num_actual_tokens=1,
+            max_query_len=1,
             max_seq_len=seq_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
@@ -414,14 +593,9 @@ class SpecPrefillRunner:
         Uses PADDING_SLOT_ID (-1) so no KV-cache is modified.
         """
         assert self.vllm_config is not None
-        PAD = -1
-        pad_slot = torch.full_like(last_pos, PAD)
-
-        pad_cad = self._build_common_attn_metadata(
-            num_tokens=1,
+        pad_cad = self._cad_single_decode(
             seq_len=cad.seq_lens[0].item(),
-            query_len=1,
-            slot_mapping=pad_slot,
+            slot_mapping=self._pad_slot_1,
             block_table=block_table,
         )
         pad_attn = self._build_attn_metadata(pad_cad)
@@ -430,7 +604,7 @@ class SpecPrefillRunner:
         slot_mapping_dict: dict[str, torch.Tensor] = {}
         for layer_name in self.draft_attn_layer_names:
             per_layer_attn_metadata[layer_name] = pad_attn
-            slot_mapping_dict[layer_name] = pad_slot
+            slot_mapping_dict[layer_name] = self._pad_slot_1
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -446,11 +620,13 @@ class SpecPrefillRunner:
     # ------------------------------------------------------------------
     # Query hook registration
     # ------------------------------------------------------------------
-    def _register_query_hooks(
+    def _register_batched_query_hooks(
         self,
-        query_buffer: list[list[torch.Tensor]],
     ) -> list[torch.utils.hooks.RemovableHook]:
-        """Register pre-hooks on draft-model ``Attention`` to capture Q."""
+        """Register pre-hooks that split per-request queries during
+        batched decode.  Uses ``self._batched_hook_active`` to know
+        which request indices are active in the current forward.
+        """
         assert self.vllm_config is not None
         hooks: list[torch.utils.hooks.RemovableHook] = []
 
@@ -464,11 +640,16 @@ class SpecPrefillRunner:
             def _pre_hook(
                 module: nn.Module,
                 args: tuple,
-                buf: list[list[torch.Tensor]] = query_buffer,
                 idx: int = layer_idx,
             ) -> None:
-                query = args[0]  # post-RoPE: [num_tokens, num_heads*head_dim]
-                buf[idx].append(query[-1:].detach().clone())
+                if not getattr(self, "_hooks_enabled", False):
+                    return
+                query = args[0]  # [n_active, num_heads*head_dim]
+                active = self._batched_hook_active
+                for j, a in enumerate(active):
+                    self._batched_hook_buffers[a][idx].append(
+                        query[j : j + 1].detach().clone()
+                    )
 
             h = attn_module.register_forward_pre_hook(_pre_hook)
             hooks.append(h)
@@ -497,72 +678,92 @@ class SpecPrefillRunner:
                 )
         return torch.stack(per_layer, dim=0)
 
-    def _collect_keys_from_paged_cache(
+    # ------------------------------------------------------------------
+    # GPU importance scoring (per-layer to bound memory)
+    # ------------------------------------------------------------------
+    def _compute_importance_gpu(
         self,
+        queries: torch.Tensor,
         prompt_len: int,
+        pool_kernel_size: int | None,
+        slot_offset: int = 0,
     ) -> torch.Tensor:
-        """Read prompt-region keys from draft-model paged KV-cache.
+        """Compute token importance directly on GPU, one layer at a time.
 
-        Returns: ``[num_layers, num_kv_heads, prompt_len, head_dim]``
+        This avoids materialising the full ``[L, H, look_ahead, prompt_len]``
+        attention-score tensor, keeping peak memory at
+        ``O(H * look_ahead * prompt_len)`` per layer.
+
+        Args:
+            queries: ``[num_layers, look_ahead, num_heads * head_dim]`` (GPU)
+            prompt_len: number of prompt tokens.
+            pool_kernel_size: smoothing kernel (None to skip).
+            slot_offset: starting slot index for this request's KV region.
+
+        Returns:
+            1-D importance tensor ``[prompt_len]`` (GPU).
         """
         assert self.vllm_config is not None
         forward_ctx = (
             self.vllm_config.compilation_config.static_forward_context
         )
         bs = self._block_size
+        H = self._num_heads
+        D = self._head_dim
+        KVH = self._num_kv_heads
+        repeat_factor = H // KVH
+        scale = 1.0 / math.sqrt(D)
 
-        slot_indices = torch.arange(prompt_len, device=self.device)
-        block_indices = slot_indices // bs
-        block_offsets = slot_indices % bs
+        abs_slots = torch.arange(prompt_len, device=self.device) + slot_offset
+        block_indices = abs_slots // bs
+        block_offsets = abs_slots % bs
 
-        per_layer = []
-        for layer_name in self.draft_attn_layer_names:
+        running_max: torch.Tensor | None = None
+
+        for layer_idx, layer_name in enumerate(self.draft_attn_layer_names):
+            # -- keys for this layer from paged cache --
             attn_layer: Attention = forward_ctx[layer_name]
             kv_cache = attn_layer.kv_cache[0]
-            # Standard layout: [2, num_blocks, block_size, num_kv_heads, head_dim]
             if kv_cache.dim() == 5 and kv_cache.shape[0] == 2:
                 key_cache = kv_cache[0]
             else:
                 key_cache = kv_cache
+            # [prompt_len, KVH, D]
             keys = key_cache[block_indices, block_offsets]
-            per_layer.append(keys)
+            # -> [KVH, prompt_len, D]
+            keys = keys.transpose(0, 1)
+            if repeat_factor > 1:
+                keys = keys.repeat_interleave(repeat_factor, dim=0)
+            # keys: [H, prompt_len, D]
 
-        stacked = torch.stack(per_layer, dim=0)
-        # Move to CPU before .contiguous() to avoid a large GPU allocation
-        # (the caller moves to CPU anyway for importance scoring).
-        return stacked.transpose(1, 2).cpu().contiguous()
+            # -- queries for this layer --
+            q = queries[layer_idx]  # [look_ahead, H*D]
+            q = q.view(-1, H, D).transpose(0, 1)  # [H, look_ahead, D]
 
-    # ------------------------------------------------------------------
-    # Attention score computation
-    # ------------------------------------------------------------------
-    def _compute_attention_scores(
-        self,
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        actual_look_ahead: int,
-    ) -> torch.Tensor:
-        """Compute Q*K^T attention scores.
+            # -- attention scores --
+            # [H, look_ahead, prompt_len]
+            attn = torch.matmul(q, keys.transpose(-1, -2)) * scale
+            attn = torch.nn.functional.softmax(attn, dim=-1)
 
-        Args:
-            queries: ``[num_layers, look_ahead, num_heads * head_dim]``
-            keys: ``[num_layers, num_kv_heads, prompt_len, head_dim]``
+            if pool_kernel_size:
+                look_ahead = attn.shape[1]
+                attn = torch.nn.functional.avg_pool1d(
+                    attn.reshape(H * look_ahead, 1, prompt_len),
+                    kernel_size=pool_kernel_size,
+                    padding=pool_kernel_size // 2,
+                    stride=1,
+                ).reshape(H, look_ahead, -1)
 
-        Returns:
-            ``[num_layers, num_heads, look_ahead, prompt_len]``
-        """
-        num_layers = queries.shape[0]
-        look_ahead = queries.shape[1]
+            # max over heads -> [look_ahead, prompt_len]
+            layer_max = attn.max(0)[0]
 
-        q = queries.view(
-            num_layers, look_ahead, self._num_heads, self._head_dim
-        )
-        q = q.transpose(1, 2)
+            if running_max is None:
+                running_max = layer_max
+            else:
+                running_max = torch.max(running_max, layer_max)
 
-        repeat_factor = self._num_heads // self._num_kv_heads
-        k = keys
-        if repeat_factor > 1:
-            k = k.repeat_interleave(repeat_factor, dim=1)
+            del keys, attn
 
-        scale = 1.0 / math.sqrt(self._head_dim)
-        attn = torch.matmul(q, k.transpose(-1, -2)) * scale
-        return attn
+        assert running_max is not None
+        importance = running_max.mean(0)  # [prompt_len]
+        return importance

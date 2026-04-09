@@ -54,6 +54,11 @@ class SpecPrefillConfig:
     """Maximum number of tokens per chunk when feeding the prompt to the
     draft model.  Keeps attention and MLP intermediate memory bounded."""
 
+    min_prompt_len: int = Field(default=256, ge=1)
+    """Minimum prompt length to trigger speculative prefill.  Prompts
+    shorter than this are passed to the main model uncompressed, since
+    the draft-model overhead would exceed any compression benefit."""
+
     ignore_eos: bool = False
     """Ignore EOS tokens during look-ahead. Useful for benchmarking only."""
 
