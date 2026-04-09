@@ -302,7 +302,8 @@ class SpecPrefillRunner:
         all_queries = self._collect_queries(query_buffer, actual_look_ahead)
 
         all_queries = all_queries.cpu()
-        all_keys = all_keys.cpu()
+        if all_keys.device.type != "cpu":
+            all_keys = all_keys.cpu()
 
         attn_scores = self._compute_attention_scores(
             all_queries, all_keys, actual_look_ahead
@@ -527,7 +528,9 @@ class SpecPrefillRunner:
             per_layer.append(keys)
 
         stacked = torch.stack(per_layer, dim=0)
-        return stacked.transpose(1, 2).contiguous()
+        # Move to CPU before .contiguous() to avoid a large GPU allocation
+        # (the caller moves to CPU anyway for importance scoring).
+        return stacked.transpose(1, 2).cpu().contiguous()
 
     # ------------------------------------------------------------------
     # Attention score computation
